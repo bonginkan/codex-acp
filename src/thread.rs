@@ -28,7 +28,6 @@ use codex_apply_patch::parse_patch;
 use codex_core::{
     CodexThread,
     config::{Config, set_project_trust_level},
-    review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
 use codex_login::auth::AuthManager;
@@ -74,6 +73,7 @@ use codex_protocol::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
     },
+    review_format::format_review_findings_block,
     user_input::UserInput,
 };
 use codex_shell_command::parse_command::parse_command;
@@ -233,25 +233,45 @@ pub trait ModelsManagerImpl: Send + Sync {
     fn get_model(
         &self,
         model_id: &Option<String>,
+        config: &Config,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>>;
-    fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
+    fn list_models(
+        &self,
+        config: &Config,
+    ) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
 }
 
 impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     fn get_model(
         &self,
         model_id: &Option<String>,
+        config: &Config,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
         let model_id = model_id.clone();
+        let http_client_factory = config.http_client_factory();
         Box::pin(async move {
-            self.get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
-                .await
+            self.get_default_model(
+                &model_id,
+                false,
+                RefreshStrategy::OnlineIfUncached,
+                http_client_factory,
+            )
+            .await
         })
     }
 
-    fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
+    fn list_models(
+        &self,
+        config: &Config,
+    ) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
+        let http_client_factory = config.http_client_factory();
         Box::pin(async move {
-            ModelsManager::list_models(self.as_ref(), RefreshStrategy::OnlineIfUncached).await
+            ModelsManager::list_models(
+                self.as_ref(),
+                RefreshStrategy::OnlineIfUncached,
+                http_client_factory,
+            )
+            .await
         })
     }
 }
@@ -1175,6 +1195,7 @@ impl PromptState {
                 collaboration_mode_kind,
                 turn_id,
                 started_at: _,
+                ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -1436,7 +1457,7 @@ impl PromptState {
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
-                let display_path = path.display().to_string();
+                let display_path = path.inferred_native_path_string();
                 client.send_notification(
                     SessionUpdate::ToolCall(
                         ToolCall::new(call_id, format!("View Image {display_path}"))
@@ -1444,7 +1465,7 @@ impl PromptState {
                             .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
                         )
                     )
-                )]).locations(vec![ToolCallLocation::new(path)])));
+                )]).locations(vec![ToolCallLocation::new(path.to_path_buf())])));
             }
             EventMsg::EnteredReviewMode(review_request) => {
                 info!("Review begin: request={review_request:?}");
@@ -1507,6 +1528,8 @@ impl PromptState {
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
+            | EventMsg::TurnModerationMetadata(..)
+            | EventMsg::SafetyBuffering(..)
             | EventMsg::ThreadRolledBack(..)
             | EventMsg::HookStarted(..)
             | EventMsg::HookCompleted(..)
@@ -1519,6 +1542,7 @@ impl PromptState {
             // TODO: Subagent UI?
             | EventMsg::CollabAgentSpawnBegin(..)
             | EventMsg::CollabAgentSpawnEnd(..)
+            | EventMsg::SubAgentActivity(..)
             | EventMsg::CollabAgentInteractionBegin(..)
             | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
@@ -1577,7 +1601,7 @@ impl PromptState {
         }
 
         let request_kind = match &request {
-            ElicitationRequest::Form { .. } => "form",
+            ElicitationRequest::Form { .. } | ElicitationRequest::OpenAiForm { .. } => "form",
             ElicitationRequest::Url { .. } => "url",
         };
 
@@ -1605,7 +1629,7 @@ impl PromptState {
         client: &SessionClient,
         event: ExitedReviewModeEvent,
     ) -> Result<(), Error> {
-        let ExitedReviewModeEvent { review_output } = event;
+        let ExitedReviewModeEvent { review_output, .. } = event;
         let Some(ReviewOutputEvent {
             findings,
             overall_correctness: _,
@@ -1905,7 +1929,7 @@ impl PromptState {
             file_extension,
             locations,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
         self.active_commands.insert(
             call_id.clone(),
             ActiveCommand {
@@ -2017,7 +2041,7 @@ impl PromptState {
             locations,
             terminal_output,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
@@ -2986,7 +3010,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
-        let model_presets = self.models_manager.list_models().await;
+        let model_presets = self.models_manager.list_models(&self.config).await;
         let config_model = self.get_current_model().await;
         let preset = model_presets
             .iter()
@@ -2995,13 +3019,14 @@ impl<A: Auth> ThreadActor<A> {
         let effort = self
             .config
             .model_reasoning_effort
+            .clone()
             .and_then(|effort| {
                 preset
                     .supported_reasoning_efforts
                     .iter()
-                    .find_map(|e| (e.effort == effort).then_some(effort))
+                    .find_map(|e| (e.effort == effort).then_some(effort.clone()))
             })
-            .unwrap_or(preset.default_reasoning_effort);
+            .unwrap_or_else(|| preset.default_reasoning_effort.clone());
 
         Some(Self::model_id(&preset.id, effort))
     }
@@ -3038,7 +3063,7 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(&self.config).await;
 
         let current_model = self.get_current_model().await;
         let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
@@ -3078,12 +3103,13 @@ impl<A: Auth> ThreadActor<A> {
             let current_effort = self
                 .config
                 .model_reasoning_effort
+                .clone()
                 .and_then(|effort| {
                     supported
                         .iter()
-                        .find_map(|e| (e.effort == effort).then_some(effort))
+                        .find_map(|e| (e.effort == effort).then_some(effort.clone()))
                 })
-                .unwrap_or(preset.default_reasoning_effort);
+                .unwrap_or_else(|| preset.default_reasoning_effort.clone());
 
             let effort_select_options = supported
                 .iter()
@@ -3149,7 +3175,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
         let model_id = value.0;
 
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(&self.config).await;
         let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
 
         let model_to_use = preset
@@ -3161,7 +3187,7 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         let effort_to_use = if let Some(preset) = preset {
-            if let Some(effort) = self.config.model_reasoning_effort
+            if let Some(effort) = self.config.model_reasoning_effort.clone()
                 && preset
                     .supported_reasoning_efforts
                     .iter()
@@ -3169,19 +3195,19 @@ impl<A: Auth> ThreadActor<A> {
             {
                 Some(effort)
             } else {
-                Some(preset.default_reasoning_effort)
+                Some(preset.default_reasoning_effort.clone())
             }
         } else {
             // If the user selected a raw model string (not a known preset), don't invent a default.
             // Keep whatever was previously configured (or leave unset) so Codex can decide.
-            self.config.model_reasoning_effort
+            self.config.model_reasoning_effort.clone()
         };
 
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
                     model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
+                    effort: Some(effort_to_use.clone()),
                     ..Default::default()
                 },
             })
@@ -3202,7 +3228,7 @@ impl<A: Auth> ThreadActor<A> {
             serde_json::from_value(value.0.as_ref().into()).map_err(|_| Error::invalid_params())?;
 
         let current_model = self.get_current_model().await;
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(&self.config).await;
         let Some(preset) = presets.iter().find(|p| p.model == current_model) else {
             return Err(Error::invalid_params()
                 .data("Reasoning effort can only be set for known model presets"));
@@ -3221,7 +3247,7 @@ impl<A: Auth> ThreadActor<A> {
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
-                    effort: Some(Some(effort)),
+                    effort: Some(Some(effort.clone())),
                     ..Default::default()
                 },
             })
@@ -3248,14 +3274,14 @@ impl<A: Auth> ThreadActor<A> {
 
         available_models.extend(
             self.models_manager
-                .list_models()
+                .list_models(&self.config)
                 .await
                 .iter()
                 .filter(|model| model.show_in_picker || model.model == config_model)
                 .flat_map(|preset| {
                     preset.supported_reasoning_efforts.iter().map(|effort| {
                         ModelInfo::new(
-                            Self::model_id(&preset.id, effort.effort),
+                            Self::model_id(&preset.id, effort.effort.clone()),
                             format!("{} ({})", preset.display_name, effort.effort),
                         )
                         .description(format!("{} {}", preset.description, effort.description))
@@ -3301,7 +3327,7 @@ impl<A: Auth> ThreadActor<A> {
                             text_elements: vec![],
                         }],
                         final_output_json_schema: None,
-                        environments: None,
+                        additional_context: Default::default(),
                         responsesapi_client_metadata: None,
                         thread_settings: Default::default(),
                     }
@@ -3357,7 +3383,7 @@ impl<A: Auth> ThreadActor<A> {
                     op = Op::UserInput {
                         items,
                         final_output_json_schema: None,
-                        environments: None,
+                        additional_context: Default::default(),
                         responsesapi_client_metadata: None,
                         thread_settings: Default::default(),
                     }
@@ -3367,7 +3393,7 @@ impl<A: Auth> ThreadActor<A> {
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
-                environments: None,
+                additional_context: Default::default(),
                 responsesapi_client_metadata: None,
                 thread_settings: Default::default(),
             }
@@ -3469,7 +3495,9 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn get_current_model(&self) -> String {
-        self.models_manager.get_model(&self.config.model).await
+        self.models_manager
+            .get_model(&self.config.model, &self.config)
+            .await
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
@@ -3483,7 +3511,7 @@ impl<A: Auth> ThreadActor<A> {
             } else {
                 self.get_current_model().await
             };
-            (fallback, self.config.model_reasoning_effort)
+            (fallback, self.config.model_reasoning_effort.clone())
         };
 
         if model_to_use.is_empty() {
@@ -3494,7 +3522,7 @@ impl<A: Auth> ThreadActor<A> {
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
                     model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
+                    effort: Some(effort_to_use.clone()),
                     ..Default::default()
                 },
             })
@@ -3748,7 +3776,9 @@ impl<A: Auth> ThreadActor<A> {
                     serde_json::from_str(arguments).ok(),
                 );
             }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok());
             }
@@ -3824,6 +3854,7 @@ impl<A: Auth> ThreadActor<A> {
                 name: _,
                 call_id,
                 output,
+                ..
             } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)));
@@ -3845,9 +3876,13 @@ impl<A: Auth> ThreadActor<A> {
                 status,
                 revised_prompt,
                 result,
+                ..
             } => {
+                let id = id
+                    .clone()
+                    .unwrap_or_else(|| generate_fallback_id("image_generation"));
                 self.client.send_tool_call(
-                    ToolCall::new(id.clone(), "Image generation")
+                    ToolCall::new(id, "Image generation")
                         .kind(ToolKind::Other)
                         .status(image_generation_tool_status(status))
                         .content(image_generation_content(
@@ -4295,6 +4330,7 @@ mod tests {
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::protocol::EnteredReviewModeEvent;
     use codex_protocol::{ThreadId, protocol::ThreadGoal};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
@@ -4323,6 +4359,51 @@ mod tests {
                 ..
             }) if text == "Hi"
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plain_prompt_steers_active_turn() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, _handle) = setup().await?;
+
+        let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["steer-block".into()]),
+            response_tx: first_response_tx,
+        })?;
+        let first_stop_rx = first_response_rx.await??;
+
+        let (steer_response_tx, steer_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["steered input".into()]),
+            response_tx: steer_response_tx,
+        })?;
+        let steer_stop_rx = steer_response_rx.await??;
+
+        {
+            let ops = thread.ops.lock().unwrap();
+            assert_eq!(ops.len(), 2);
+            assert!(matches!(
+                &ops[1],
+                Op::UserInput { items, .. }
+                    if matches!(items.as_slice(), [UserInput::Text { text, .. }] if text == "steered input")
+            ));
+        }
+
+        thread.op_tx.send(Event {
+            id: "0".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "0".to_string(),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+
+        assert_eq!(first_stop_rx.await??, StopReason::EndTurn);
+        assert_eq!(steer_stop_rx.await??, StopReason::EndTurn);
 
         Ok(())
     }
@@ -4586,7 +4667,7 @@ mod tests {
                     text_elements: vec![]
                 }],
                 final_output_json_schema: None,
-                environments: None,
+                additional_context: Default::default(),
                 responsesapi_client_metadata: None,
                 thread_settings: Default::default(),
             }],
@@ -4864,11 +4945,15 @@ mod tests {
         fn get_model(
             &self,
             _model_id: &Option<String>,
+            _config: &Config,
         ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
             Box::pin(async { all_model_presets()[0].to_owned().id })
         }
 
-        fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
+        fn list_models(
+            &self,
+            _config: &Config,
+        ) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
             Box::pin(async { all_model_presets().to_owned() })
         }
     }
@@ -4934,7 +5019,8 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: codex_utils_path_uri::PathUri::from_host_native_path(&cwd)
+                                    .expect("valid cwd"),
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo a".into(),
                                 }],
@@ -4947,7 +5033,8 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: codex_utils_path_uri::PathUri::from_host_native_path(&cwd)
+                                    .expect("valid cwd"),
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo b".into(),
                                 }],
@@ -4960,7 +5047,8 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: codex_utils_path_uri::PathUri::from_host_native_path(&cwd)
+                                    .expect("valid cwd"),
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
@@ -4978,7 +5066,8 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: codex_utils_path_uri::PathUri::from_host_native_path(&cwd)
+                                    .expect("valid cwd"),
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
@@ -5060,6 +5149,8 @@ mod tests {
                                     }),
                                 })
                                 .unwrap();
+                        } else if prompt == "steer-block" {
+                            // Keep this turn active until the steering test emits completion.
                         } else if prompt == "approval-block" {
                             self.op_tx
                                 .send(Event {
@@ -5068,6 +5159,7 @@ mod tests {
                                         call_id: "call-id".to_string(),
                                         approval_id: Some("approval-id".to_string()),
                                         turn_id: id.to_string(),
+                                        environment_id: None,
                                         started_at_ms: 0,
                                         command: vec!["echo".to_string(), "hi".to_string()],
                                         cwd: std::env::current_dir().unwrap().try_into().unwrap(),
@@ -5133,6 +5225,7 @@ mod tests {
                                     model_context_window: None,
                                     collaboration_mode_kind: ModeKind::default(),
                                     turn_id: id.to_string(),
+                                    trace_id: None,
                                     started_at: None,
                                 }),
                             })
@@ -5164,13 +5257,20 @@ mod tests {
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
-                                msg: EventMsg::EnteredReviewMode(review_request.clone()),
+                                msg: EventMsg::EnteredReviewMode(EnteredReviewModeEvent {
+                                    target: review_request.target.clone(),
+                                    user_facing_hint: review_request.user_facing_hint.clone(),
+                                    turn_id: Some(id.to_string()),
+                                    item_id: None,
+                                }),
                             })
                             .unwrap();
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
                                 msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                                    turn_id: Some(id.to_string()),
+                                    item_id: None,
                                     review_output: Some(ReviewOutputEvent {
                                         findings: vec![],
                                         overall_correctness: String::new(),
@@ -5399,6 +5499,7 @@ mod tests {
                 call_id: "call-id".to_string(),
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
+                environment_id: None,
                 started_at_ms: 0,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 cwd: std::env::current_dir()?.try_into()?,
@@ -5656,6 +5757,7 @@ mod tests {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
+                    environment_id: None,
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
                     cwd: std::env::current_dir()?.try_into()?,
@@ -5732,6 +5834,7 @@ mod tests {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
+                    environment_id: None,
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
                     cwd: std::env::current_dir()?.try_into()?,
