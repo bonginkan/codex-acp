@@ -1,4 +1,8 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
+// rust-v0.146.0 の codex-core は session_startup_prewarm の async block が
+// 深くネストしており、既定の recursion_limit=128 では layout 計算が
+// "queries overflow the depth limit" で失敗する。
+#![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use agent_client_protocol::ByteStreams;

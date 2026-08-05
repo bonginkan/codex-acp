@@ -14,9 +14,10 @@ use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, SortDirection, StateDbHandle, ThreadManager, ThreadSortKey,
-    config::Config, find_thread_path_by_id_str, init_state_db, parse_cursor,
-    resolve_installation_id, thread_store_from_config,
+    CodexAppsToolsCache, NewThread, RolloutRecorder, SortDirection, StartThreadOptions,
+    StateDbHandle, ThreadManager, ThreadSortKey, build_models_manager, config::Config,
+    find_thread_path_by_id_str, init_state_db, parse_cursor, resolve_installation_id,
+    thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::empty_extension_registry;
@@ -77,10 +78,15 @@ impl CodexAgent {
         let state_db = init_state_db(&config).await;
         let local_runtime_paths =
             ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
+        // rust-v0.146.0 で from_codex_home は HttpClientFactory を受け取る。
         let environment_manager = Arc::new(
-            EnvironmentManager::from_codex_home(&config.codex_home, Some(local_runtime_paths))
-                .await
-                .map_err(std::io::Error::other)?,
+            EnvironmentManager::from_codex_home(
+                config.codex_home.clone(),
+                Some(local_runtime_paths),
+                config.http_client_factory(),
+            )
+            .await
+            .map_err(std::io::Error::other)?,
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let agent_graph_store =
@@ -89,6 +95,10 @@ impl CodexAgent {
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
+            // rust-v0.146.0 で models_manager / codex_apps_tools_cache が必須になった。
+            // models_manager がモデルメタデータ(gpt-5.6-sol 等)の解決を担う。
+            build_models_manager(&config, auth_manager.clone()),
+            CodexAppsToolsCache::default(),
             SessionSource::Unknown,
             environment_manager,
             empty_extension_registry(),
@@ -577,7 +587,10 @@ impl CodexAgent {
             thread_id,
             thread,
             session_configured: _,
-        } = Box::pin(self.thread_manager.start_thread(config.clone()))
+        } = Box::pin(
+            self.thread_manager
+                .start_thread(StartThreadOptions::new(config.clone())),
+        )
             .await
             .map_err(|_e| Error::internal_error())?;
 

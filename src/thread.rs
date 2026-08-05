@@ -1290,6 +1290,7 @@ impl PromptState {
                 call_id,
                 query,
                 action,
+                results: _,
             }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
@@ -1415,10 +1416,11 @@ impl PromptState {
                 turn_id,
                 item,
                 completed_at_ms: _,
+                started_at_ms: _,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, error: _, started_at: _, }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -1445,7 +1447,7 @@ impl PromptState {
                     json!({ "message": message, "codex_error_info": codex_error_info }),
                 )));
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _, started_at: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.detach_pending_interactions();
                 self.resolve(Ok(StopReason::Cancelled));
@@ -1555,6 +1557,10 @@ impl PromptState {
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
+            // rust-v0.146.0 で追加。ACP 側に対応する通知が無いため無視する。
+            | EventMsg::EnvironmentConnected(..)
+            | EventMsg::EnvironmentDisconnected(..)
+            | EventMsg::RawResponseCompleted(..)
             | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
             | EventMsg::DeprecationNotice(..)
@@ -1849,6 +1855,12 @@ impl PromptState {
                                     ResourceLink::new(image_url.clone(), image_url),
                                 )))
                             }
+                            // rust-v0.146.0 で追加。画像と同じく参照リンクとして渡す。
+                            DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                                ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(
+                                    ResourceLink::new(audio_url.clone(), audio_url),
+                                )))
+                            }
                         })
                         .chain(error.map(|e| ToolCallContent::Content(Content::new(e))))
                         .collect::<Vec<_>>(),
@@ -2026,6 +2038,8 @@ impl PromptState {
             turn_id: _,
             source: _,
             interaction_input: _,
+            plugin_id: _,
+            script_path: _,
             call_id,
             command: _,
             started_at_ms: _,
@@ -2120,6 +2134,8 @@ impl PromptState {
             command: _,
             cwd: _,
             parsed_cmd: _,
+            plugin_id: _,
+            script_path: _,
             source: _,
             interaction_input: _,
             call_id,
@@ -2551,14 +2567,17 @@ fn build_exec_permission_options(
                     },
                 }
             }
-            ReviewDecision::Denied => ExecPermissionOption {
+            // rust-v0.146.0 で Denied は rejection 文字列を持つ struct variant になった。
+            ReviewDecision::Denied { rejection } => ExecPermissionOption {
                 option_id: "denied",
                 permission_option: PermissionOption::new(
                     "denied",
                     "No, continue without running it",
                     PermissionOptionKind::RejectOnce,
                 ),
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied {
+                    rejection: rejection.clone(),
+                },
             },
             ReviewDecision::Abort => ExecPermissionOption {
                 option_id: "abort",
@@ -3879,7 +3898,8 @@ impl<A: Auth> ThreadActor<A> {
                 ..
             } => {
                 let id = id
-                    .clone()
+                    .as_ref()
+                    .map(ToString::to_string)
                     .unwrap_or_else(|| generate_fallback_id("image_generation"));
                 self.client.send_tool_call(
                     ToolCall::new(id, "Image generation")
@@ -4204,18 +4224,23 @@ fn format_file_system_special(value: &FileSystemSpecialPath) -> String {
     }
 }
 
-fn format_file_system_subpath(base: &str, subpath: Option<&Path>) -> String {
+/// rust-v0.146.0 で `FileSystemSpecialPath` の `subpath` は `Option<String>` に
+/// なったため、`&Path` ではなく `&str` を受け取る。
+fn format_file_system_subpath(base: &str, subpath: Option<&str>) -> String {
     match subpath {
-        Some(subpath) => format!("{base}/{}", subpath.display()),
+        Some(subpath) => format!("{base}/{subpath}"),
         None => base.to_string(),
     }
 }
 
 /// Extract title and call_id from a WebSearchAction (used for replay)
 fn web_search_action_to_title_and_id(
-    id: &Option<String>,
+    id: &Option<codex_protocol::ResponseItemId>,
     action: &codex_protocol::models::WebSearchAction,
 ) -> (String, String) {
+    // rust-v0.146.0 で ResponseItem の id は ResponseItemId になった。
+    // 以降の分岐は従来どおり Option<String> として扱う。
+    let id = id.as_ref().map(ToString::to_string);
     match action {
         codex_protocol::models::WebSearchAction::Search { query, queries } => {
             let title = queries
