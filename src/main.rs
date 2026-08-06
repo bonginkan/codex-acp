@@ -1,3 +1,7 @@
+// lib.rs と同じ理由。rust-v0.146.0 の codex-core は既定の recursion_limit=128 で
+// layout 計算が "queries overflow the depth limit" になる。
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use clap::Parser;
 use codex_arg0::arg0_dispatch_or_else;
