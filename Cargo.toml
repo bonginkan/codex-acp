@@ -27,6 +27,7 @@ codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" 
 codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" }
 codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" }
 codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" }
+codex-features = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" }
 codex-home = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" }
 codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" }
 codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.146.0" }
@@ -44,6 +45,7 @@ serde = { version = "1", features = ["derive"] }
 # codex-cli depends on codex-tui, which enables serde_json/preserve_order; match
 # that behavior here because it affects MCP keychain account hashing.
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 shlex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat"] }
@@ -52,6 +54,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 heck = "0.5.0"
 unicode-segmentation = "1.11.0"
 uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+sha2 = "0.10"
 
 [lints.rust]
 let-underscore = "warn"

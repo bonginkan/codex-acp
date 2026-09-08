@@ -40,6 +40,7 @@ use codex_protocol::{
     config_types::TrustLevel,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
+    items::TurnItem,
     mcp::CallToolResult,
     models::{
         ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
@@ -59,9 +60,9 @@ use codex_protocol::{
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
         ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        McpStartupCompleteEvent, McpStartupStatus, McpStartupUpdateEvent, McpToolCallBeginEvent,
+        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
+        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
         TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
@@ -116,6 +117,88 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+const RESTRICTED_MCP_SERVER: &str = "ninna_inquiry";
+const RESTRICTED_MCP_TOOL: &str = "knowledge_query";
+
+fn restricted_mcp_invocation_is_exact(invocation: &McpInvocation) -> bool {
+    invocation.server == RESTRICTED_MCP_SERVER && invocation.tool == RESTRICTED_MCP_TOOL
+}
+
+fn restricted_turn_item_is_allowed(item: &TurnItem) -> bool {
+    match item {
+        TurnItem::UserMessage(..) | TurnItem::AgentMessage(..) | TurnItem::Reasoning(..) => true,
+        TurnItem::McpToolCall(item) => {
+            item.server == RESTRICTED_MCP_SERVER
+                && item.tool == RESTRICTED_MCP_TOOL
+                && item.connector_id.is_none()
+                && item.mcp_app_resource_uri.is_none()
+                && item.link_id.is_none()
+                && item.app_name.is_none()
+                && item.action_name.is_none()
+                && item.plugin_id.is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Fail-closed runtime allowlist for the restricted inquiry session.
+fn restricted_event_is_allowed(event: &EventMsg) -> bool {
+    match event {
+        EventMsg::TurnStarted(..)
+        | EventMsg::TurnComplete(..)
+        | EventMsg::TurnAborted(..)
+        | EventMsg::ShutdownComplete
+        | EventMsg::TokenCount(..)
+        | EventMsg::UserMessage(..)
+        | EventMsg::AgentMessage(..)
+        | EventMsg::AgentMessageContentDelta(..)
+        | EventMsg::AgentReasoning(..)
+        | EventMsg::AgentReasoningRawContent(..)
+        | EventMsg::AgentReasoningSectionBreak(..)
+        | EventMsg::ReasoningContentDelta(..)
+        | EventMsg::ReasoningRawContentDelta(..)
+        | EventMsg::SessionConfigured(..)
+        | EventMsg::ThreadSettingsApplied(..)
+        | EventMsg::TurnModerationMetadata(..)
+        | EventMsg::SafetyBuffering(..) => true,
+        EventMsg::ItemStarted(ItemStartedEvent { item, .. })
+        | EventMsg::ItemCompleted(ItemCompletedEvent { item, .. }) => {
+            restricted_turn_item_is_allowed(item)
+        }
+        EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
+            server == RESTRICTED_MCP_SERVER
+                && matches!(status, McpStartupStatus::Starting | McpStartupStatus::Ready)
+        }
+        EventMsg::McpStartupComplete(McpStartupCompleteEvent {
+            ready,
+            failed,
+            cancelled,
+        }) => {
+            ready == &[RESTRICTED_MCP_SERVER.to_string()]
+                && failed.is_empty()
+                && cancelled.is_empty()
+        }
+        EventMsg::McpToolCallBegin(event) => {
+            restricted_mcp_invocation_is_exact(&event.invocation)
+                && event.connector_id.is_none()
+                && event.mcp_app_resource_uri.is_none()
+                && event.link_id.is_none()
+                && event.app_name.is_none()
+                && event.action_name.is_none()
+                && event.plugin_id.is_none()
+        }
+        EventMsg::McpToolCallEnd(event) => {
+            restricted_mcp_invocation_is_exact(&event.invocation)
+                && event.connector_id.is_none()
+                && event.mcp_app_resource_uri.is_none()
+                && event.link_id.is_none()
+                && event.app_name.is_none()
+                && event.action_name.is_none()
+                && event.plugin_id.is_none()
+        }
+        _ => false,
+    }
+}
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -349,13 +432,14 @@ impl Thread {
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         cx: ConnectionTo<Client>,
+        restricted: bool,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = mpsc::unbounded_channel();
 
         let actor = ThreadActor::new(
             auth,
-            SessionClient::new(session_id, cx, client_capabilities),
+            SessionClient::new(session_id, cx, client_capabilities, restricted),
             thread.clone(),
             models_manager,
             config,
@@ -1160,6 +1244,16 @@ impl PromptState {
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         self.event_count += 1;
 
+        if client.restricted && !restricted_event_is_allowed(&event) {
+            warn!("restricted runtime emitted an event outside the exact allowlist");
+            self.detach_pending_interactions();
+            self.resolve(Err(
+                Error::internal_error().data("restricted runtime policy violation")
+            ));
+            drop(self.thread.submit(Op::Shutdown).await);
+            return;
+        }
+
         // Complete any previous web search before starting a new one
         match &event {
             EventMsg::Error(..)
@@ -1210,7 +1304,11 @@ impl PromptState {
                     }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
-                info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
+                if client.restricted {
+                    info!(%thread_id, %turn_id, "restricted allowlisted item started");
+                } else {
+                    info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
+                }
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
@@ -1219,7 +1317,11 @@ impl PromptState {
                 local_images: _,
                 ..
             }) => {
-                info!("User message: {message:?}");
+                if client.restricted {
+                    info!(message_length = message.len(), "restricted user message received");
+                } else {
+                    info!("User message: {message:?}");
+                }
             }
             EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
                 thread_id,
@@ -1227,7 +1329,11 @@ impl PromptState {
                 item_id,
                 delta,
             }) => {
-                info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                if client.restricted {
+                    info!(%thread_id, %turn_id, %item_id, delta_length = delta.len(), "restricted agent message delta received");
+                } else {
+                    info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                }
                 self.seen_message_deltas = true;
                 client.send_agent_text(delta);
             }
@@ -1245,9 +1351,15 @@ impl PromptState {
                 delta,
                 content_index: index,
             }) => {
-                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
-                self.seen_reasoning_deltas = true;
-                client.send_agent_thought(delta);
+                if client.restricted {
+                    info!(%thread_id, %turn_id, %item_id, index, delta_length = delta.len(), "restricted reasoning delta received");
+                } else {
+                    info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
+                }
+                if !client.restricted {
+                    self.seen_reasoning_deltas = true;
+                    client.send_agent_thought(delta);
+                }
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
@@ -1255,20 +1367,30 @@ impl PromptState {
             }) => {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
-                self.seen_reasoning_deltas = true;
-                client.send_agent_thought("\n\n");
+                if !client.restricted {
+                    self.seen_reasoning_deltas = true;
+                    client.send_agent_thought("\n\n");
+                }
             }
             EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
-                info!("Agent message (non-delta) received: {message:?}");
+                if client.restricted {
+                    info!(message_length = message.len(), "restricted agent message received");
+                } else {
+                    info!("Agent message (non-delta) received: {message:?}");
+                }
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
                     client.send_agent_text(message);
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                info!("Agent reasoning (non-delta) received: {text:?}");
+                if client.restricted {
+                    info!(reasoning_length = text.len(), "restricted agent reasoning received");
+                } else {
+                    info!("Agent reasoning (non-delta) received: {text:?}");
+                }
                 // We didn't receive this message via streaming
-                if !std::mem::take(&mut self.seen_reasoning_deltas) {
+                if !client.restricted && !std::mem::take(&mut self.seen_reasoning_deltas) {
                     client.send_agent_thought(text);
                 }
             }
@@ -1311,19 +1433,27 @@ impl PromptState {
                 self.end_image_generation(client, event);
             }
             EventMsg::ExecApprovalRequest(event) => {
-                info!(
-                    "Command execution started: call_id={}, command={:?}",
-                    event.call_id, event.command
-                );
+                if client.restricted {
+                    info!(call_id = %event.call_id, "restricted command approval requested");
+                } else {
+                    info!(
+                        "Command execution started: call_id={}, command={:?}",
+                        event.call_id, event.command
+                    );
+                }
                 if let Err(err) = self.exec_approval(client, event) {
                     self.resolve(Err(err));
                 }
             }
             EventMsg::ExecCommandBegin(event) => {
-                info!(
-                    "Command execution started: call_id={}, command={:?}",
-                    event.call_id, event.command
-                );
+                if client.restricted {
+                    info!(call_id = %event.call_id, "restricted command event received");
+                } else {
+                    info!(
+                        "Command execution started: call_id={}, command={:?}",
+                        event.call_id, event.command
+                    );
+                }
                 self.exec_command_begin(client, event);
             }
             EventMsg::ExecCommandOutputDelta(delta_event) => {
@@ -1337,10 +1467,14 @@ impl PromptState {
                 self.exec_command_end(client, end_event);
             }
             EventMsg::TerminalInteraction(event) => {
-                info!(
-                    "Terminal interaction: call_id={}, process_id={}, stdin={}",
-                    event.call_id, event.process_id, event.stdin
-                );
+                if client.restricted {
+                    info!(call_id = %event.call_id, process_id = %event.process_id, stdin_length = event.stdin.len(), "restricted terminal interaction received");
+                } else {
+                    info!(
+                        "Terminal interaction: call_id={}, process_id={}, stdin={}",
+                        event.call_id, event.process_id, event.stdin
+                    );
+                }
                 self.terminal_interaction(client, event);
             }
             EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, namespace, tool, arguments, started_at_ms: _ }) => {
@@ -1418,13 +1552,21 @@ impl PromptState {
                 completed_at_ms: _,
                 started_at_ms: _,
             }) => {
-                info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                if client.restricted {
+                    info!(%thread_id, %turn_id, "restricted allowlisted item completed");
+                } else {
+                    info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, error: _, started_at: _, }) => {
-                info!(
-                    "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
-                    self.event_count
-                );
+                if client.restricted {
+                    info!(%turn_id, events = self.event_count, message_length = last_agent_message.as_ref().map_or(0, String::len), "restricted turn completed");
+                } else {
+                    info!(
+                        "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
+                        self.event_count
+                    );
+                }
                 self.detach_pending_interactions();
                 self.resolve(Ok(StopReason::EndTurn));
             }
@@ -1470,10 +1612,18 @@ impl PromptState {
                 )]).locations(vec![ToolCallLocation::new(path.to_path_buf())])));
             }
             EventMsg::EnteredReviewMode(review_request) => {
-                info!("Review begin: request={review_request:?}");
+                if client.restricted {
+                    info!("restricted review-mode event received");
+                } else {
+                    info!("Review begin: request={review_request:?}");
+                }
             }
             EventMsg::ExitedReviewMode(event) => {
-                info!("Review end: output={event:?}");
+                if client.restricted {
+                    info!("restricted review-mode exit received");
+                } else {
+                    info!("Review end: output={event:?}");
+                }
                 if let Err(err) = self.review_mode_exit(client, event) {
                     self.resolve(Err(err));
                 }
@@ -2674,6 +2824,7 @@ struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn ClientSender>,
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
+    restricted: bool,
 }
 
 impl SessionClient {
@@ -2681,11 +2832,13 @@ impl SessionClient {
         session_id: SessionId,
         cx: ConnectionTo<Client>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
+        restricted: bool,
     ) -> Self {
         Self {
             session_id,
             client: Arc::new(AcpConnection(cx)),
             client_capabilities,
+            restricted,
         }
     }
 
@@ -2699,6 +2852,7 @@ impl SessionClient {
             session_id,
             client,
             client_capabilities,
+            restricted: false,
         }
     }
 
@@ -2804,6 +2958,11 @@ impl SessionClient {
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
     ) -> Result<RequestPermissionResponse, Error> {
+        if self.restricted {
+            return Ok(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            ));
+        }
         self.client
             .request_permission(RequestPermissionRequest::new(
                 self.session_id.clone(),
@@ -4421,6 +4580,8 @@ mod tests {
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                 last_agent_message: None,
                 turn_id: "0".to_string(),
+                error: None,
+                started_at: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -5041,6 +5202,8 @@ mod tests {
                             };
                             send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: "call-a".into(),
+                                plugin_id: None,
+                                script_path: None,
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
@@ -5055,6 +5218,8 @@ mod tests {
                             }));
                             send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                                 call_id: "call-b".into(),
+                                plugin_id: None,
+                                script_path: None,
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
@@ -5069,6 +5234,8 @@ mod tests {
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-a".into(),
+                                plugin_id: None,
+                                script_path: None,
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
@@ -5088,6 +5255,8 @@ mod tests {
                             }));
                             send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                                 call_id: "call-b".into(),
+                                plugin_id: None,
+                                script_path: None,
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
@@ -5108,6 +5277,8 @@ mod tests {
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id,
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -5136,6 +5307,8 @@ mod tests {
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id,
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -5168,6 +5341,8 @@ mod tests {
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id,
+                                        error: None,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                         time_to_first_token_ms: None,
@@ -5182,6 +5357,8 @@ mod tests {
                                     id: id.to_string(),
                                     msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                                         call_id: "call-id".to_string(),
+                                        plugin_id: None,
+                                        script_path: None,
                                         approval_id: Some("approval-id".to_string()),
                                         turn_id: id.to_string(),
                                         environment_id: None,
@@ -5234,6 +5411,8 @@ mod tests {
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id: id.to_string(),
+                                        error: None,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                         time_to_first_token_ms: None,
@@ -5271,6 +5450,8 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -5314,6 +5495,8 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -5336,6 +5519,7 @@ mod tests {
                                         turn_id: Some(active_prompt_id),
                                         reason:
                                             codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                     }),
@@ -5522,6 +5706,8 @@ mod tests {
             &session_client,
             ExecApprovalRequestEvent {
                 call_id: "call-id".to_string(),
+                plugin_id: None,
+                script_path: None,
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
                 environment_id: None,
@@ -5533,7 +5719,12 @@ mod tests {
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 additional_permissions: None,
-                available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Denied]),
+                available_decisions: Some(vec![
+                    ReviewDecision::Approved,
+                    ReviewDecision::Denied {
+                        rejection: "denied".to_string(),
+                    },
+                ]),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hi".to_string(),
                 }],
@@ -5574,8 +5765,10 @@ mod tests {
             Some(Op::ExecApproval {
                 id,
                 turn_id,
-                decision: ReviewDecision::Denied,
-            }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
+                decision: ReviewDecision::Denied { rejection },
+            }) if id == "approval-id"
+                && turn_id.as_deref() == Some("turn-id")
+                && rejection == "denied"
         ));
 
         Ok(())
@@ -5780,6 +5973,8 @@ mod tests {
                 &session_client,
                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                     call_id: "call-id".to_string(),
+                    plugin_id: None,
+                    script_path: None,
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
                     environment_id: None,
@@ -5857,6 +6052,8 @@ mod tests {
                 &session_client,
                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                     call_id: "call-id".to_string(),
+                    plugin_id: None,
+                    script_path: None,
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
                     environment_id: None,
