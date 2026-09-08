@@ -24,6 +24,9 @@ struct Args {
 
 fn main() -> Result<()> {
     arg0_dispatch_or_else(|args| async move {
+        if codex_acp::query_proxy::run_requested_mode().await? {
+            return Ok(());
+        }
         let cli = Args::parse();
         if cli.ninna_print_build_manifest {
             writeln!(

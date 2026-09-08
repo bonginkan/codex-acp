@@ -14,6 +14,18 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
+#[cfg(unix)]
+pub mod query_proxy;
+
+#[cfg(not(unix))]
+pub mod query_proxy {
+    pub async fn run_requested_mode() -> anyhow::Result<bool> {
+        if std::env::args().any(|arg| arg == "--ninna-query-proxy") {
+            anyhow::bail!("restricted query proxy requires Unix sockets");
+        }
+        Ok(false)
+    }
+}
 mod restricted;
 mod thread;
 
