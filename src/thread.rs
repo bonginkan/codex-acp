@@ -3614,14 +3614,16 @@ impl<A: Auth> ThreadActor<A> {
                         info!(
                             "Steered into in-flight turn; turn_id: {turn_id} (response dissolves into running turn)"
                         );
-                        let active = self
-                            .submissions
-                            .values_mut()
-                            .find(|submission| submission.is_active())
-                            .ok_or_else(|| {
-                                Error::internal_error()
-                                    .data("Codex accepted a steer without an active ACP submission")
-                            })?;
+                        let active = self.submissions.get_mut(&turn_id).ok_or_else(|| {
+                            Error::internal_error().data(format!(
+                                "Codex steered into unknown ACP submission: {turn_id}"
+                            ))
+                        })?;
+                        if !active.is_active() {
+                            return Err(Error::internal_error().data(format!(
+                                "Codex steered into inactive ACP submission: {turn_id}"
+                            )));
+                        }
                         active.attach_steer(response_tx);
                         return Ok(response_rx);
                     }
@@ -4650,6 +4652,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_steer_response_tracks_core_turn_id() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, _handle) = setup().await?;
+
+        thread.queue_turn_route(TurnInputSubmission::Started {
+            turn_id: "0".to_string(),
+        });
+        let (first_response_tx, first_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["steer-block".into()]),
+            response_tx: first_response_tx,
+        })?;
+        let first_stop_rx = first_response_rx.await??;
+
+        thread.queue_turn_route(TurnInputSubmission::Started {
+            turn_id: "1".to_string(),
+        });
+        let (second_response_tx, second_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["steer-block".into()]),
+            response_tx: second_response_tx,
+        })?;
+        let second_stop_rx = second_response_rx.await??;
+
+        thread.queue_turn_route(TurnInputSubmission::Steered {
+            turn_id: "1".to_string(),
+        });
+        let (steer_response_tx, steer_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["steered input".into()]),
+            response_tx: steer_response_tx,
+        })?;
+        let mut steer_stop_rx = steer_response_rx.await??;
+
+        thread.op_tx.send(Event {
+            id: "0".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "0".to_string(),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+
+        assert_eq!(first_stop_rx.await??, StopReason::EndTurn);
+        assert!(matches!(
+            steer_stop_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        thread.op_tx.send(Event {
+            id: "1".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "1".to_string(),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+
+        assert_eq!(second_stop_rx.await??, StopReason::EndTurn);
+        assert_eq!(steer_stop_rx.await??, StopReason::EndTurn);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_steer_rejects_unknown_or_inactive_turn_id() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, _handle) = setup().await?;
+
+        thread.queue_turn_route(TurnInputSubmission::Steered {
+            turn_id: "unknown".to_string(),
+        });
+        let (unknown_response_tx, unknown_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["steered input".into()]),
+            response_tx: unknown_response_tx,
+        })?;
+        assert!(unknown_response_rx.await?.is_err());
+
+        thread.queue_turn_route(TurnInputSubmission::Started {
+            turn_id: "1".to_string(),
+        });
+        let (active_response_tx, active_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["steer-block".into()]),
+            response_tx: active_response_tx,
+        })?;
+        let inactive_stop_rx = active_response_rx.await??;
+        drop(inactive_stop_rx);
+
+        thread.queue_turn_route(TurnInputSubmission::Steered {
+            turn_id: "1".to_string(),
+        });
+        let (inactive_response_tx, inactive_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["steered input".into()]),
+            response_tx: inactive_response_tx,
+        })?;
+        assert!(inactive_response_rx.await?.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -5191,6 +5303,7 @@ mod tests {
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
+        turn_routes: std::sync::Mutex<VecDeque<TurnInputSubmission>>,
         ops: std::sync::Mutex<Vec<RecordedOp>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
@@ -5228,10 +5341,15 @@ mod tests {
             StubCodexThread {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
+                turn_routes: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
+        }
+
+        fn queue_turn_route(&self, route: TurnInputSubmission) {
+            self.turn_routes.lock().unwrap().push_back(route);
         }
     }
 
@@ -5301,33 +5419,40 @@ mod tests {
                             } => content,
                             _ => unimplemented!(),
                         };
-                        let active_prompt_id = self.active_prompt_id.lock().unwrap().clone();
-                        let route = match (&mode, active_prompt_id) {
-                            (TurnInputMode::StartOrSteer, Some(turn_id))
-                            | (TurnInputMode::Steer { .. }, Some(turn_id)) => {
-                                TurnInputSubmission::Steered { turn_id }
-                            }
-                            (TurnInputMode::StartIfIdle, Some(_)) => {
-                                TurnInputSubmission::NotSubmitted {
-                                    reason: codex_protocol::turn_input::NotSubmittedReason::NotIdle,
+                        let route = self.turn_routes.lock().unwrap().pop_front();
+                        let route = route.unwrap_or_else(|| {
+                            let active_prompt_id =
+                                self.active_prompt_id.lock().unwrap().clone();
+                            match (&mode, active_prompt_id) {
+                                (TurnInputMode::StartOrSteer, Some(turn_id))
+                                | (TurnInputMode::Steer { .. }, Some(turn_id)) => {
+                                    TurnInputSubmission::Steered { turn_id }
                                 }
-                            }
-                            (TurnInputMode::Steer { .. }, None) => {
-                                TurnInputSubmission::NotSubmitted {
-                                    reason:
-                                        codex_protocol::turn_input::NotSubmittedReason::NoActiveTurn,
+                                (TurnInputMode::StartIfIdle, Some(_)) => {
+                                    TurnInputSubmission::NotSubmitted {
+                                        reason:
+                                            codex_protocol::turn_input::NotSubmittedReason::NotIdle,
+                                    }
                                 }
+                                (TurnInputMode::Steer { .. }, None) => {
+                                    TurnInputSubmission::NotSubmitted {
+                                        reason: codex_protocol::turn_input::NotSubmittedReason::NoActiveTurn,
+                                    }
+                                }
+                                (_, None) => TurnInputSubmission::Started {
+                                    turn_id: id.to_string(),
+                                },
                             }
-                            (_, None) => TurnInputSubmission::Started {
-                                turn_id: id.to_string(),
-                            },
+                        });
+                        let started_turn_id = match &route {
+                            TurnInputSubmission::Started { turn_id } => Some(turn_id.clone()),
+                            _ => None,
                         };
-                        let started = matches!(route, TurnInputSubmission::Started { .. });
                         reply.send(Ok(route)).unwrap();
-                        if !started {
+                        let Some(started_turn_id) = started_turn_id else {
                             return Ok(id.to_string());
-                        }
-                        *self.active_prompt_id.lock().unwrap() = Some(id.to_string());
+                        };
+                        *self.active_prompt_id.lock().unwrap() = Some(started_turn_id);
                         let prompt = items
                             .into_iter()
                             .map(|i| match i {
