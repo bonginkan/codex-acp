@@ -16,6 +16,8 @@ use codex_protocol::permissions::{
     FileSystemAccessMode, FileSystemPath, FileSystemSpecialPath, NetworkSandboxPolicy,
 };
 use codex_protocol::protocol::{AskForApproval, SessionConfiguredEvent};
+#[cfg(feature = "ninna-validation-attestation")]
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -38,6 +40,105 @@ pub const RESTRICTED_MODEL: &str = "gpt-6-astra";
 pub const RESTRICTED_MODEL_PROVIDER: &str = "openai";
 pub const RESTRICTED_REASONING_EFFORT: &str = "xhigh";
 pub const RESTRICTED_SERVICE_TIER: &str = "priority";
+
+#[cfg(feature = "ninna-validation-attestation")]
+const VALIDATION_PROVENANCE: &str = "synthetic_slack_api_fixture";
+#[cfg(feature = "ninna-validation-attestation")]
+const VALIDATION_CLASSIFICATION: &str = "SYNTHETIC_SHARED_PATH_ONLY";
+
+#[cfg(feature = "ninna-validation-attestation")]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ValidationSessionBinding {
+    schema_version: u32,
+    validation_provenance: String,
+    result_classification: String,
+    run_id_hash: String,
+    candidate_manifest_sha256: String,
+    openab_binary_sha256: String,
+    openab_source_commit: String,
+    acp_binary_sha256: String,
+    acp_source_commit: String,
+    fixture_sha256: String,
+    session_key_hash: String,
+    principal_hash: String,
+    profile: String,
+    destination_fingerprint: String,
+}
+
+#[cfg(feature = "ninna-validation-attestation")]
+impl ValidationSessionBinding {
+    fn validate(&self, runtime: &RestrictedRuntime) -> Result<(), String> {
+        let boot = runtime
+            .binding
+            .lock()
+            .map_err(|_| "attestation lock poisoned")?
+            .clone()
+            .ok_or_else(|| "restricted connection was not attested".to_string())?;
+        self.validate_identity(env!("NINNA_SOURCE_COMMIT"), &boot.binary_sha256)
+    }
+
+    fn validate_identity(
+        &self,
+        expected_acp_source_commit: &str,
+        expected_acp_binary_sha256: &str,
+    ) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.validation_provenance != VALIDATION_PROVENANCE
+            || self.result_classification != VALIDATION_CLASSIFICATION
+        {
+            return Err("validation binding has an unsupported schema or classification".into());
+        }
+        for (name, value) in [
+            ("runIdHash", self.run_id_hash.as_str()),
+            (
+                "candidateManifestSha256",
+                self.candidate_manifest_sha256.as_str(),
+            ),
+            ("openabBinarySha256", self.openab_binary_sha256.as_str()),
+            ("acpBinarySha256", self.acp_binary_sha256.as_str()),
+            ("fixtureSha256", self.fixture_sha256.as_str()),
+            ("sessionKeyHash", self.session_key_hash.as_str()),
+            ("principalHash", self.principal_hash.as_str()),
+            (
+                "destinationFingerprint",
+                self.destination_fingerprint.as_str(),
+            ),
+        ] {
+            validate_lower_hex(name, value, 64)?;
+        }
+        validate_lower_hex("openabSourceCommit", &self.openab_source_commit, 40)?;
+        validate_lower_hex("acpSourceCommit", &self.acp_source_commit, 40)?;
+        if self.profile.is_empty()
+            || self.profile.len() > 64
+            || !self
+                .profile
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err("validation binding profile is not a bounded identifier".into());
+        }
+        if self.acp_source_commit != expected_acp_source_commit {
+            return Err("validation binding ACP source commit differs from this binary".into());
+        }
+        if self.acp_binary_sha256 != expected_acp_binary_sha256 {
+            return Err("validation binding ACP binary digest differs from this process".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ninna-validation-attestation")]
+fn validate_lower_hex(name: &str, value: &str, len: usize) -> Result<(), String> {
+    if value.len() != len
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{name} must be lowercase {len}-character hex"));
+    }
+    Ok(())
+}
 
 fn validate_effective_session_identity(
     model: &str,
@@ -70,6 +171,8 @@ pub struct BuildManifest {
     embedded_codex_tag: &'static str,
     embedded_codex_commit: &'static str,
     target: &'static str,
+    #[cfg(feature = "ninna-validation-attestation")]
+    additional_features: Vec<&'static str>,
 }
 
 impl BuildManifest {
@@ -84,6 +187,8 @@ impl BuildManifest {
             embedded_codex_tag: EMBEDDED_CODEX_TAG,
             embedded_codex_commit: EMBEDDED_CODEX_COMMIT,
             target: env!("NINNA_BUILD_TARGET"),
+            #[cfg(feature = "ninna-validation-attestation")]
+            additional_features: vec!["ninna-validation-attestation"],
         }
     }
 }
@@ -554,6 +659,10 @@ struct SessionAttestation {
     effective_reasoning_effort: String,
     effective_service_tier: String,
     session_config: ConfigSnapshot,
+    source_commit: &'static str,
+    #[cfg(feature = "ninna-validation-attestation")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_binding: Option<ValidationSessionBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -661,6 +770,25 @@ impl RestrictedRuntime {
         Ok(())
     }
 
+    #[cfg(feature = "ninna-validation-attestation")]
+    pub fn validation_session_binding(
+        &self,
+        meta: Option<&Meta>,
+    ) -> Result<Option<ValidationSessionBinding>, String> {
+        let value = meta
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(Value::Null);
+        let Some(binding) = value.get("ninnaValidationBinding") else {
+            return Ok(None);
+        };
+        let binding: ValidationSessionBinding = serde_json::from_value(binding.clone())
+            .map_err(|error| format!("invalid ninnaValidationBinding session metadata: {error}"))?;
+        binding.validate(self)?;
+        Ok(Some(binding))
+    }
+
     pub fn session_attestation(
         &self,
         session_config: &Config,
@@ -668,6 +796,9 @@ impl RestrictedRuntime {
         session_id: &str,
         auth_mode: AuthMode,
         session_configured: &SessionConfiguredEvent,
+        #[cfg(feature = "ninna-validation-attestation")] validation_binding: Option<
+            ValidationSessionBinding,
+        >,
     ) -> Result<Meta, String> {
         if auth_mode != AuthMode::Chatgpt {
             return Err("restricted mode requires ChatGPT-managed authentication".into());
@@ -715,12 +846,27 @@ impl RestrictedRuntime {
             effective_reasoning_effort,
             effective_service_tier,
             session_config: snapshot,
+            source_commit: env!("NINNA_SOURCE_COMMIT"),
+            #[cfg(feature = "ninna-validation-attestation")]
+            validation_binding,
         };
         Ok(Meta::from_iter([(
             "ninnaRestrictedAttestation".to_string(),
             serde_json::to_value(attestation).map_err(|error| error.to_string())?,
         )]))
     }
+}
+
+pub fn reject_validation_metadata_when_feature_disabled(meta: Option<&Meta>) -> Result<(), String> {
+    let value = meta
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(Value::Null);
+    if value.get("ninnaValidationBinding").is_some() {
+        return Err("validation session metadata requires the disabled validation feature".into());
+    }
+    Ok(())
 }
 
 pub fn request_hash<T: Serialize>(request: &T) -> Result<String, String> {
@@ -847,6 +993,16 @@ mod tests {
     }
 
     #[test]
+    fn validation_metadata_is_rejected_by_the_default_session_surface() {
+        let meta = Meta::from_iter([(
+            "ninnaValidationBinding".to_string(),
+            json!({"schemaVersion": 1}),
+        )]);
+        assert!(reject_validation_metadata_when_feature_disabled(Some(&meta)).is_err());
+        assert!(reject_validation_metadata_when_feature_disabled(None).is_ok());
+    }
+
+    #[test]
     fn canonical_json_orders_object_keys() {
         let left = json!({"z": 1, "a": {"d": 2, "b": 3}});
         let right = json!({"a": {"b": 3, "d": 2}, "z": 1});
@@ -863,6 +1019,48 @@ mod tests {
         assert_eq!(manifest["embeddedCodexTag"], EMBEDDED_CODEX_TAG);
         assert_eq!(manifest["embeddedCodexCommit"], EMBEDDED_CODEX_COMMIT);
         assert_eq!(manifest["cargoLockSha256"].as_str().unwrap().len(), 64);
+        #[cfg(feature = "ninna-validation-attestation")]
+        assert_eq!(
+            manifest["additionalFeatures"],
+            json!(["ninna-validation-attestation"])
+        );
+        #[cfg(not(feature = "ninna-validation-attestation"))]
+        assert!(manifest.get("additionalFeatures").is_none());
+    }
+
+    #[cfg(feature = "ninna-validation-attestation")]
+    #[test]
+    fn validation_binding_is_deny_unknown_and_requires_exact_literals() {
+        let mut value = json!({
+            "schemaVersion": 1,
+            "validationProvenance": VALIDATION_PROVENANCE,
+            "resultClassification": VALIDATION_CLASSIFICATION,
+            "runIdHash": "a".repeat(64),
+            "candidateManifestSha256": "b".repeat(64),
+            "openabBinarySha256": "c".repeat(64),
+            "openabSourceCommit": "d".repeat(40),
+            "acpBinarySha256": "e".repeat(64),
+            "acpSourceCommit": env!("NINNA_SOURCE_COMMIT"),
+            "fixtureSha256": "f".repeat(64),
+            "sessionKeyHash": "1".repeat(64),
+            "principalHash": "2".repeat(64),
+            "profile": "inquiry_private",
+            "destinationFingerprint": "3".repeat(64)
+        });
+        let binding = serde_json::from_value::<ValidationSessionBinding>(value.clone()).unwrap();
+        binding
+            .validate_identity(env!("NINNA_SOURCE_COMMIT"), &"e".repeat(64))
+            .unwrap();
+        let mut wrong_literal = value.clone();
+        wrong_literal["resultClassification"] = json!("PASS");
+        assert!(
+            serde_json::from_value::<ValidationSessionBinding>(wrong_literal)
+                .unwrap()
+                .validate_identity(env!("NINNA_SOURCE_COMMIT"), &"e".repeat(64))
+                .is_err()
+        );
+        value["selfReportedPass"] = Value::Bool(true);
+        assert!(serde_json::from_value::<ValidationSessionBinding>(value).is_err());
     }
 
     #[test]

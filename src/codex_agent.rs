@@ -41,7 +41,9 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::restricted::{RestrictedRuntime, request_hash, sha256_hex};
+use crate::restricted::{
+    RestrictedRuntime, reject_validation_metadata_when_feature_disabled, request_hash, sha256_hex,
+};
 use crate::thread::Thread;
 
 /// The Codex implementation of the ACP Agent.
@@ -672,6 +674,20 @@ impl CodexAgent {
         // Check before sending if authentication was successful or not
         self.check_auth().await?;
 
+        #[cfg(feature = "ninna-validation-attestation")]
+        let validation_binding = if let Some(restricted) = &self.restricted {
+            restricted
+                .validation_session_binding(request.meta.as_ref())
+                .map_err(|error| Error::invalid_params().data(error))?
+        } else {
+            reject_validation_metadata_when_feature_disabled(request.meta.as_ref())
+                .map_err(|error| Error::invalid_params().data(error))?;
+            None
+        };
+        #[cfg(not(feature = "ninna-validation-attestation"))]
+        reject_validation_metadata_when_feature_disabled(request.meta.as_ref())
+            .map_err(|error| Error::invalid_params().data(error))?;
+
         let request_hash = self
             .restricted
             .as_ref()
@@ -718,6 +734,8 @@ impl CodexAgent {
                         session_id.0.as_ref(),
                         auth_mode,
                         &session_configured,
+                        #[cfg(feature = "ninna-validation-attestation")]
+                        validation_binding,
                     )
                     .map_err(|error| Error::invalid_params().data(error))?,
             )
