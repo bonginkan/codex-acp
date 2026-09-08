@@ -8,10 +8,14 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 const FIXED_MCP_SOCKET: &str = "/run/ninna/query.sock";
 const FIXED_BACKEND_SOCKET: &str = "/run/ninna-broker/query.sock";
@@ -45,19 +49,33 @@ pub async fn run_requested_mode() -> Result<bool> {
     let expected_client_uid = exact_option(&args[2..], "expected-client-uid")?
         .parse::<u32>()
         .context("invalid expected client uid")?;
-    if args.len() != 6
+    let authorization_fd = exact_option(&args[2..], "authorization-fd")?
+        .parse::<i32>()
+        .context("invalid authorization fd")?;
+    if args.len() != 7
         || !frontend.starts_with("/run/ninna-proxy/")
         || backend != FIXED_BACKEND_SOCKET
         || !is_sha256(&worker_instance)
         || expected_client_uid == 0
+        || authorization_fd != 4
     {
         bail!("invalid restricted query proxy invocation");
     }
+    // SAFETY: OpenAB creates a private socketpair, duplicates the child end to
+    // the exact inherited FD 4, and transfers ownership to this process.
+    let authorization = unsafe { StdUnixStream::from_raw_fd(authorization_fd) };
+    authorization
+        .set_nonblocking(true)
+        .context("configure query authorization channel")?;
+    let authorization = Arc::new(Mutex::new(
+        UnixStream::from_std(authorization).context("adopt query authorization channel")?,
+    ));
     run_query_proxy(
         Path::new(&frontend),
         Path::new(&backend),
         &worker_instance,
         expected_client_uid,
+        authorization,
     )
     .await?;
     Ok(true)
@@ -84,6 +102,7 @@ async fn run_query_proxy(
     backend: &Path,
     worker_instance: &str,
     expected_client_uid: u32,
+    authorization: Arc<Mutex<UnixStream>>,
 ) -> Result<()> {
     if let Some(parent) = frontend.parent() {
         let metadata = std::fs::symlink_metadata(parent).context("stat query proxy directory")?;
@@ -103,8 +122,18 @@ async fn run_query_proxy(
         let (client, _) = listener.accept().await?;
         let backend = backend.to_path_buf();
         let worker_instance = worker_instance.to_string();
+        let authorization = Arc::clone(&authorization);
         tokio::spawn(async move {
-            drop(proxy_one(client, backend, worker_instance, expected_client_uid).await);
+            drop(
+                proxy_one(
+                    client,
+                    backend,
+                    worker_instance,
+                    expected_client_uid,
+                    authorization,
+                )
+                .await,
+            );
         });
     }
 }
@@ -114,6 +143,7 @@ async fn proxy_one(
     backend_path: PathBuf,
     worker_instance: String,
     expected_client_uid: u32,
+    authorization: Arc<Mutex<UnixStream>>,
 ) -> Result<()> {
     let credentials = client
         .peer_cred()
@@ -138,14 +168,61 @@ async fn proxy_one(
         .await
         .context("knowledge broker query binding timeout")??;
     }
-    if acknowledgement.len() > 128
-        || serde_json::from_str::<Value>(acknowledgement.trim())?
-            != json!({"ok": true, "bound": true})
+    if acknowledgement.len() > 256 {
+        bail!("knowledge broker did not confirm the query binding");
+    }
+    let acknowledgement: Value = serde_json::from_str(acknowledgement.trim())?;
+    let authorization_binding = acknowledgement
+        .get("authorizationBinding")
+        .and_then(Value::as_str)
+        .filter(|value| is_sha256(value))
+        .ok_or_else(|| anyhow!("knowledge broker omitted the authorization binding"))?;
+    if acknowledgement.get("ok").and_then(Value::as_bool) != Some(true)
+        || acknowledgement.get("bound").and_then(Value::as_bool) != Some(true)
+        || acknowledgement
+            .as_object()
+            .is_none_or(|value| value.len() != 3)
     {
         bail!("knowledge broker did not confirm the query binding");
     }
+    // Ask OpenAB to perform a fresh Slack API visibility check for this exact
+    // Knowledge turn. This private channel is outside the ACP namespace. The
+    // frontend remains unread until the exact positive ACK arrives.
+    {
+        let mut authorization = authorization.lock().await;
+        authorization
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "workerInstance": worker_instance,
+                        "authorizationBinding": authorization_binding,
+                    })
+                )
+                .as_bytes(),
+            )
+            .await?;
+        authorization.flush().await?;
+        let mut response = String::new();
+        {
+            let mut reader = BufReader::new(&mut *authorization);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                reader.read_line(&mut response),
+            )
+            .await
+            .context("live query authorization timeout")??;
+        }
+        if response.len() > 128
+            || serde_json::from_str::<Value>(response.trim())?
+                != json!({"ok": true, "authorized": true})
+        {
+            bail!("live query authorization was denied");
+        }
+    }
     // Only after the broker acknowledges the immutable turn binding may any
-    // bytes controlled by the MCP child cross into the trusted backend.
+    // bytes controlled by the MCP child cross into the trusted backend, and
+    // only after OpenAB has refreshed current Slack visibility for that turn.
     tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
     Ok(())
 }
@@ -244,4 +321,90 @@ fn knowledge_tool() -> Value {
             "required": ["query"]
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_authorization_denial_forwards_no_query_bytes() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend_path = std::env::temp_dir().join(format!(
+            "codex-acp-query-auth-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&backend_path).unwrap();
+        let binding = "b".repeat(64);
+        let backend_binding = binding.clone();
+        let backend = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut handshake = String::new();
+            reader.read_line(&mut handshake).await.unwrap();
+            reader
+                .get_mut()
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "ok": true,
+                            "bound": true,
+                            "authorizationBinding": backend_binding,
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut leaked = Vec::new();
+            reader.read_to_end(&mut leaked).await.unwrap();
+            leaked
+        });
+
+        let (proxy_authorization, mut trusted_authorizer) = UnixStream::pair().unwrap();
+        let worker = "a".repeat(64);
+        let expected_worker = worker.clone();
+        let authorization = tokio::spawn(async move {
+            let mut request = String::new();
+            BufReader::new(&mut trusted_authorizer)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(request.trim()).unwrap(),
+                json!({
+                    "workerInstance": expected_worker,
+                    "authorizationBinding": binding,
+                })
+            );
+            trusted_authorizer
+                .write_all(b"{\"ok\":false}\n")
+                .await
+                .unwrap();
+        });
+
+        let (proxy_client, mut model_client) = UnixStream::pair().unwrap();
+        model_client
+            .write_all(b"{\"args\":{\"query\":\"must-not-cross\"}}\n")
+            .await
+            .unwrap();
+        model_client.shutdown().await.unwrap();
+
+        let result = proxy_one(
+            proxy_client,
+            backend_path.clone(),
+            worker,
+            unsafe { libc::geteuid() },
+            Arc::new(Mutex::new(proxy_authorization)),
+        )
+        .await;
+        assert!(result.is_err());
+        authorization.await.unwrap();
+        assert!(backend.await.unwrap().is_empty());
+        drop(std::fs::remove_file(backend_path));
+    }
 }

@@ -642,7 +642,7 @@ impl CodexAgent {
         let NewThread {
             thread_id,
             thread,
-            session_configured: _,
+            session_configured,
         } = Box::pin(
             self.thread_manager
                 .start_thread(StartThreadOptions::new(config.clone())),
@@ -651,6 +651,32 @@ impl CodexAgent {
         .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
+        // Validate the effective SessionConfigured values before registering
+        // any ACP-visible session. A model/provider/reasoning mismatch must not
+        // leave a session that a later request could reuse.
+        let restricted_meta = if let (Some(restricted), Some(request_hash)) =
+            (&self.restricted, request_hash.as_ref())
+        {
+            let auth_mode = self
+                .auth_manager
+                .auth()
+                .await
+                .ok_or_else(Error::auth_required)?
+                .auth_mode();
+            Some(
+                restricted
+                    .session_attestation(
+                        &config,
+                        request_hash.clone(),
+                        session_id.0.as_ref(),
+                        auth_mode,
+                        &session_configured,
+                    )
+                    .map_err(|error| Error::invalid_params().data(error))?,
+            )
+        } else {
+            None
+        };
         // Record the session root for filesystem sandboxing.
         self.session_roots
             .lock()
@@ -686,16 +712,7 @@ impl CodexAgent {
                 .models(load.models)
                 .config_options(load.config_options)
         };
-        if let (Some(restricted), Some(request_hash)) = (&self.restricted, request_hash) {
-            let auth_mode = self
-                .auth_manager
-                .auth()
-                .await
-                .ok_or_else(Error::auth_required)?
-                .auth_mode();
-            let meta = restricted
-                .session_attestation(&config, request_hash, session_id.0.as_ref(), auth_mode)
-                .map_err(|error| Error::invalid_params().data(error))?;
+        if let Some(meta) = restricted_meta {
             Ok(response.meta(meta))
         } else {
             Ok(response)

@@ -15,7 +15,7 @@ use codex_protocol::models::{ManagedFileSystemPermissions, PermissionProfile};
 use codex_protocol::permissions::{
     FileSystemAccessMode, FileSystemPath, FileSystemSpecialPath, NetworkSandboxPolicy,
 };
-use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::{AskForApproval, SessionConfiguredEvent};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -34,6 +34,29 @@ pub const RESTRICTED_MCP_ARGS: [&str; 2] = ["serve", "--socket=/run/ninna/query.
 pub const REQUIREMENTS_PATH: &str = "/etc/codex/requirements.toml";
 pub const EMBEDDED_CODEX_TAG: &str = "rust-v0.146.0";
 pub const EMBEDDED_CODEX_COMMIT: &str = "e363b08c9175ac1cbe5893615dd2cb9ddf95043b";
+pub const RESTRICTED_MODEL: &str = "gpt-6-astra";
+pub const RESTRICTED_MODEL_PROVIDER: &str = "openai";
+pub const RESTRICTED_REASONING_EFFORT: &str = "xhigh";
+pub const RESTRICTED_SERVICE_TIER: &str = "priority";
+
+fn validate_effective_session_identity(
+    model: &str,
+    provider: &str,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+) -> Result<(), String> {
+    if model != RESTRICTED_MODEL
+        || provider != RESTRICTED_MODEL_PROVIDER
+        || reasoning_effort != Some(RESTRICTED_REASONING_EFFORT)
+        || service_tier != Some(RESTRICTED_SERVICE_TIER)
+    {
+        return Err(
+            "effective restricted session model/provider/reasoning/tier does not match the trusted configuration"
+                .into(),
+        );
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +130,10 @@ struct ShellEnvironmentSnapshot {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigSnapshot {
+    model: Option<String>,
+    model_provider_id: String,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
     approval_policy: String,
     active_permission_profile: Option<String>,
     permission_profile: Value,
@@ -254,6 +281,13 @@ impl ConfigSnapshot {
         mcp_servers.sort_by(|left, right| left.name.cmp(&right.name));
 
         Ok(Self {
+            model: config.model.clone(),
+            model_provider_id: config.model_provider_id.clone(),
+            reasoning_effort: config
+                .model_reasoning_effort
+                .as_ref()
+                .map(ToString::to_string),
+            service_tier: config.service_tier.clone(),
             approval_policy: config.permissions.approval_policy.get().to_string(),
             active_permission_profile: config
                 .permissions
@@ -337,6 +371,15 @@ impl ConfigSnapshot {
     }
 
     pub fn validate_restricted(&self) -> Result<(), String> {
+        if self.model.as_deref() != Some(RESTRICTED_MODEL)
+            || self.model_provider_id != RESTRICTED_MODEL_PROVIDER
+            || self.reasoning_effort.as_deref() != Some(RESTRICTED_REASONING_EFFORT)
+            || self.service_tier.as_deref() != Some(RESTRICTED_SERVICE_TIER)
+        {
+            return Err(
+                "restricted model, provider, reasoning, or service tier is not pinned".into(),
+            );
+        }
         if self.approval_policy != AskForApproval::Never.to_string() {
             return Err("approval policy is not never".into());
         }
@@ -506,6 +549,10 @@ struct SessionAttestation {
     base_config_fingerprint: String,
     session_config_fingerprint: String,
     auth_kind: &'static str,
+    effective_model: String,
+    effective_model_provider: String,
+    effective_reasoning_effort: String,
+    effective_service_tier: String,
     session_config: ConfigSnapshot,
 }
 
@@ -620,6 +667,7 @@ impl RestrictedRuntime {
         request_hash: String,
         session_id: &str,
         auth_mode: AuthMode,
+        session_configured: &SessionConfiguredEvent,
     ) -> Result<Meta, String> {
         if auth_mode != AuthMode::Chatgpt {
             return Err("restricted mode requires ChatGPT-managed authentication".into());
@@ -630,6 +678,21 @@ impl RestrictedRuntime {
         if session_fingerprint != self.base_fingerprint {
             return Err("session Config differs from attested base Config".into());
         }
+        let effective_reasoning_effort = session_configured
+            .reasoning_effort
+            .as_ref()
+            .map(ToString::to_string)
+            .ok_or_else(|| "effective reasoning effort is unavailable".to_string())?;
+        let effective_service_tier = session_configured
+            .service_tier
+            .clone()
+            .ok_or_else(|| "effective service tier is unavailable".to_string())?;
+        validate_effective_session_identity(
+            &session_configured.model,
+            &session_configured.model_provider_id,
+            Some(effective_reasoning_effort.as_str()),
+            Some(effective_service_tier.as_str()),
+        )?;
         let binding = self
             .binding
             .lock()
@@ -647,6 +710,10 @@ impl RestrictedRuntime {
             base_config_fingerprint: self.base_fingerprint.clone(),
             session_config_fingerprint: session_fingerprint,
             auth_kind: "chatgpt",
+            effective_model: session_configured.model.clone(),
+            effective_model_provider: session_configured.model_provider_id.clone(),
+            effective_reasoning_effort,
+            effective_service_tier,
             session_config: snapshot,
         };
         Ok(Meta::from_iter([(
@@ -796,5 +863,25 @@ mod tests {
         assert_eq!(manifest["embeddedCodexTag"], EMBEDDED_CODEX_TAG);
         assert_eq!(manifest["embeddedCodexCommit"], EMBEDDED_CODEX_COMMIT);
         assert_eq!(manifest["cargoLockSha256"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn effective_astra_identity_rejects_fallbacks() {
+        validate_effective_session_identity(
+            RESTRICTED_MODEL,
+            RESTRICTED_MODEL_PROVIDER,
+            Some(RESTRICTED_REASONING_EFFORT),
+            Some(RESTRICTED_SERVICE_TIER),
+        )
+        .unwrap();
+        assert!(
+            validate_effective_session_identity(
+                "gpt-5-fallback",
+                RESTRICTED_MODEL_PROVIDER,
+                Some(RESTRICTED_REASONING_EFFORT),
+                Some(RESTRICTED_SERVICE_TIER),
+            )
+            .is_err()
+        );
     }
 }
