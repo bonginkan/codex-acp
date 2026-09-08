@@ -26,7 +26,11 @@ use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
 };
-use codex_protocol::{ThreadId, mcp::ClientMcpExtensions, protocol::SessionSource};
+use codex_protocol::{
+    ThreadId,
+    mcp::ClientMcpExtensions,
+    protocol::{SessionConfiguredEvent, SessionSource},
+};
 use codex_rollout::InitialHistory;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::{
@@ -37,7 +41,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::restricted::{RestrictedRuntime, request_hash};
+use crate::restricted::{RestrictedRuntime, request_hash, sha256_hex};
 use crate::thread::Thread;
 
 /// The Codex implementation of the ACP Agent.
@@ -65,6 +69,47 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+const SESSION_RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+fn session_runtime_evidence_value(
+    session_id: &str,
+    process_id: u32,
+    model: &str,
+    model_provider: &str,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": SESSION_RUNTIME_EVIDENCE_SCHEMA_VERSION,
+        "processId": process_id,
+        "sessionIdHash": sha256_hex(session_id.as_bytes()),
+        "sourceCommit": option_env!("NINNA_SOURCE_COMMIT").unwrap_or("unknown"),
+        "effectiveModel": model,
+        "effectiveModelProvider": model_provider,
+        "effectiveReasoningEffort": reasoning_effort,
+        "effectiveServiceTier": service_tier,
+    })
+}
+
+fn normal_session_runtime_meta(
+    session_id: &SessionId,
+    session_configured: &SessionConfiguredEvent,
+) -> acp::schema::Meta {
+    acp::schema::Meta::from_iter([(
+        "ninnaSessionRuntimeEvidence".to_string(),
+        session_runtime_evidence_value(
+            session_id.0.as_ref(),
+            std::process::id(),
+            &session_configured.model,
+            &session_configured.model_provider_id,
+            session_configured
+                .reasoning_effort
+                .as_ref()
+                .map(ToString::to_string),
+            session_configured.service_tier.clone(),
+        ),
+    )])
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -656,7 +701,7 @@ impl CodexAgent {
         // Validate the effective SessionConfigured values before registering
         // any ACP-visible session. A model/provider/reasoning mismatch must not
         // leave a session that a later request could reuse.
-        let restricted_meta = if let (Some(restricted), Some(request_hash)) =
+        let response_meta = if let (Some(restricted), Some(request_hash)) =
             (&self.restricted, request_hash.as_ref())
         {
             let auth_mode = self
@@ -677,7 +722,14 @@ impl CodexAgent {
                     .map_err(|error| Error::invalid_params().data(error))?,
             )
         } else {
-            None
+            // Bind the normal-mode evidence to the exact Core
+            // SessionConfigured event returned by this start_thread call.
+            // The client receives it on the same response and stdio process as
+            // the ACP session id, rather than re-reading launch configuration.
+            Some(normal_session_runtime_meta(
+                &session_id,
+                &session_configured,
+            ))
         };
         // Record the session root for filesystem sandboxing.
         self.session_roots
@@ -714,7 +766,7 @@ impl CodexAgent {
                 .models(load.models)
                 .config_options(load.config_options)
         };
-        if let Some(meta) = restricted_meta {
+        if let Some(meta) = response_meta {
             Ok(response.meta(meta))
         } else {
             Ok(response)
@@ -1078,5 +1130,39 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_runtime_evidence_value;
+
+    #[test]
+    fn normal_session_runtime_evidence_includes_effective_priority() {
+        let value = session_runtime_evidence_value(
+            "session-1",
+            42,
+            "gpt-6-astra",
+            "openai",
+            Some("xhigh".to_string()),
+            Some("priority".to_string()),
+        );
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["processId"], 42);
+        assert_eq!(value["effectiveModel"], "gpt-6-astra");
+        assert_eq!(value["effectiveModelProvider"], "openai");
+        assert_eq!(value["effectiveReasoningEffort"], "xhigh");
+        assert_eq!(value["effectiveServiceTier"], "priority");
+        assert_ne!(value["sessionIdHash"], "session-1");
+    }
+
+    #[test]
+    fn normal_session_runtime_evidence_does_not_invent_missing_values() {
+        let value =
+            session_runtime_evidence_value("session-2", 43, "gpt-6-astra", "openai", None, None);
+
+        assert!(value["effectiveReasoningEffort"].is_null());
+        assert!(value["effectiveServiceTier"].is_null());
     }
 }

@@ -783,7 +783,7 @@ fn process_start_ticks() -> Option<u64> {
         .ok()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
