@@ -8,18 +8,147 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use uuid::Uuid;
 
 const FIXED_MCP_SOCKET: &str = "/run/ninna/query.sock";
 const FIXED_BACKEND_SOCKET: &str = "/run/ninna-broker/query.sock";
 const MAX_FRAME: usize = 64 * 1024;
+const QUERY_AUTHORIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+struct QueryAuthorizationClient {
+    stream: Mutex<UnixStream>,
+    raw_fd: i32,
+    poisoned: AtomicBool,
+}
+
+struct QueryAuthorizationAttempt<'a> {
+    client: &'a QueryAuthorizationClient,
+    completed: bool,
+}
+
+impl QueryAuthorizationAttempt<'_> {
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for QueryAuthorizationAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.client.poison_now();
+        }
+    }
+}
+
+impl QueryAuthorizationClient {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            raw_fd: stream.as_raw_fd(),
+            stream: Mutex::new(stream),
+            poisoned: AtomicBool::new(false),
+        }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    fn poison_now(&self) {
+        if !self.poisoned.swap(true, Ordering::AcqRel) {
+            unsafe {
+                libc::shutdown(self.raw_fd, libc::SHUT_RDWR);
+            }
+        }
+    }
+
+    async fn authorize(&self, worker_instance: &str, turn_binding: &str) -> Result<()> {
+        self.authorize_with_timeout(worker_instance, turn_binding, QUERY_AUTHORIZATION_TIMEOUT)
+            .await
+    }
+
+    async fn authorize_with_timeout(
+        &self,
+        worker_instance: &str,
+        turn_binding: &str,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        if self.is_poisoned() {
+            bail!("query authorization channel is poisoned");
+        }
+        let query_nonce = Uuid::new_v4().simple().to_string();
+        let expires_at_epoch_millis = epoch_millis()?
+            .checked_add(
+                u64::try_from(timeout.as_millis()).context("authorization timeout overflow")?,
+            )
+            .ok_or_else(|| anyhow!("authorization deadline overflow"))?;
+        let request = json!({
+            "workerInstance": worker_instance,
+            "turnBinding": turn_binding,
+            "queryNonce": query_nonce,
+            "expiresAtEpochMillis": expires_at_epoch_millis,
+        });
+        let expected_acknowledgement = json!({
+            "ok": true,
+            "authorized": true,
+            "workerInstance": worker_instance,
+            "turnBinding": turn_binding,
+            "queryNonce": query_nonce,
+            "expiresAtEpochMillis": expires_at_epoch_millis,
+        });
+        let attempt = QueryAuthorizationAttempt {
+            client: self,
+            completed: false,
+        };
+        let exchange = async {
+            let mut authorization = self.stream.lock().await;
+            if self.is_poisoned() {
+                bail!("query authorization channel is poisoned");
+            }
+            authorization
+                .write_all(format!("{request}\n").as_bytes())
+                .await?;
+            authorization.flush().await?;
+            let mut response = String::new();
+            let read = BufReader::new(&mut *authorization)
+                .read_line(&mut response)
+                .await?;
+            if read == 0 || response.len() > 512 {
+                bail!("live query authorization response is unavailable or oversized");
+            }
+            if epoch_millis()? >= expires_at_epoch_millis
+                || serde_json::from_str::<Value>(response.trim())? != expected_acknowledgement
+            {
+                bail!("live query authorization was denied or mismatched");
+            }
+            Ok(())
+        };
+        match tokio::time::timeout(timeout, exchange).await {
+            Ok(Ok(())) => {
+                attempt.complete();
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => bail!("live query authorization timeout"),
+        }
+    }
+}
+
+fn epoch_millis() -> Result<u64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("epoch millisecond value overflow")
+}
 
 pub async fn run_requested_mode() -> Result<bool> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -67,7 +196,7 @@ pub async fn run_requested_mode() -> Result<bool> {
     authorization
         .set_nonblocking(true)
         .context("configure query authorization channel")?;
-    let authorization = Arc::new(Mutex::new(
+    let authorization = Arc::new(QueryAuthorizationClient::new(
         UnixStream::from_std(authorization).context("adopt query authorization channel")?,
     ));
     run_query_proxy(
@@ -102,7 +231,7 @@ async fn run_query_proxy(
     backend: &Path,
     worker_instance: &str,
     expected_client_uid: u32,
-    authorization: Arc<Mutex<UnixStream>>,
+    authorization: Arc<QueryAuthorizationClient>,
 ) -> Result<()> {
     if let Some(parent) = frontend.parent() {
         let metadata = std::fs::symlink_metadata(parent).context("stat query proxy directory")?;
@@ -118,23 +247,36 @@ async fn run_query_proxy(
     }
     let listener = UnixListener::bind(frontend).context("bind query proxy frontend")?;
     std::fs::set_permissions(frontend, std::fs::Permissions::from_mode(0o660))?;
+    let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
     loop {
-        let (client, _) = listener.accept().await?;
-        let backend = backend.to_path_buf();
-        let worker_instance = worker_instance.to_string();
-        let authorization = Arc::clone(&authorization);
-        tokio::spawn(async move {
-            drop(
-                proxy_one(
-                    client,
-                    backend,
-                    worker_instance,
-                    expected_client_uid,
-                    authorization,
-                )
-                .await,
-            );
-        });
+        tokio::select! {
+            failure = failure_rx.recv() => {
+                let error = failure.ok_or_else(|| anyhow!("query proxy failure channel closed"))?;
+                authorization.poison_now();
+                return Err(error).context("restricted query failed; retiring proxy");
+            }
+            accepted = listener.accept() => {
+                let (client, _) = accepted?;
+                let backend = backend.to_path_buf();
+                let worker_instance = worker_instance.to_string();
+                let authorization = Arc::clone(&authorization);
+                let failure_tx = failure_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = proxy_one(
+                        client,
+                        backend,
+                        worker_instance,
+                        expected_client_uid,
+                        Arc::clone(&authorization),
+                    )
+                    .await
+                    {
+                        authorization.poison_now();
+                        drop(failure_tx.send(error));
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -143,7 +285,7 @@ async fn proxy_one(
     backend_path: PathBuf,
     worker_instance: String,
     expected_client_uid: u32,
-    authorization: Arc<Mutex<UnixStream>>,
+    authorization: Arc<QueryAuthorizationClient>,
 ) -> Result<()> {
     let credentials = client
         .peer_cred()
@@ -188,38 +330,9 @@ async fn proxy_one(
     // Ask OpenAB to perform a fresh Slack API visibility check for this exact
     // Knowledge turn. This private channel is outside the ACP namespace. The
     // frontend remains unread until the exact positive ACK arrives.
-    {
-        let mut authorization = authorization.lock().await;
-        authorization
-            .write_all(
-                format!(
-                    "{}\n",
-                    json!({
-                        "workerInstance": worker_instance,
-                        "authorizationBinding": authorization_binding,
-                    })
-                )
-                .as_bytes(),
-            )
-            .await?;
-        authorization.flush().await?;
-        let mut response = String::new();
-        {
-            let mut reader = BufReader::new(&mut *authorization);
-            tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                reader.read_line(&mut response),
-            )
-            .await
-            .context("live query authorization timeout")??;
-        }
-        if response.len() > 128
-            || serde_json::from_str::<Value>(response.trim())?
-                != json!({"ok": true, "authorized": true})
-        {
-            bail!("live query authorization was denied");
-        }
-    }
+    authorization
+        .authorize(&worker_instance, authorization_binding)
+        .await?;
     // Only after the broker acknowledges the immutable turn binding may any
     // bytes controlled by the MCP child cross into the trusted backend, and
     // only after OpenAB has refreshed current Slack visibility for that turn.
@@ -374,13 +487,11 @@ mod tests {
                 .read_line(&mut request)
                 .await
                 .unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(request.trim()).unwrap(),
-                json!({
-                    "workerInstance": expected_worker,
-                    "authorizationBinding": binding,
-                })
-            );
+            let request = serde_json::from_str::<Value>(request.trim()).unwrap();
+            assert_eq!(request["workerInstance"], expected_worker);
+            assert_eq!(request["turnBinding"], binding);
+            assert_eq!(request["queryNonce"].as_str().unwrap().len(), 32);
+            assert!(request["expiresAtEpochMillis"].as_u64().unwrap() > epoch_millis().unwrap());
             trusted_authorizer
                 .write_all(b"{\"ok\":false}\n")
                 .await
@@ -399,12 +510,171 @@ mod tests {
             backend_path.clone(),
             worker,
             unsafe { libc::geteuid() },
-            Arc::new(Mutex::new(proxy_authorization)),
+            Arc::new(QueryAuthorizationClient::new(proxy_authorization)),
         )
         .await;
         assert!(result.is_err());
         authorization.await.unwrap();
         assert!(backend.await.unwrap().is_empty());
         drop(std::fs::remove_file(backend_path));
+    }
+
+    #[tokio::test]
+    async fn timed_out_ack_cannot_authorize_a_later_query() {
+        let (client_stream, mut authorizer) = UnixStream::pair().unwrap();
+        let client = Arc::new(QueryAuthorizationClient::new(client_stream));
+        let server = tokio::spawn(async move {
+            let mut request = String::new();
+            BufReader::new(&mut authorizer)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            let request = serde_json::from_str::<Value>(request.trim()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let late_ack = json!({
+                "ok": true,
+                "authorized": true,
+                "workerInstance": request["workerInstance"],
+                "turnBinding": request["turnBinding"],
+                "queryNonce": request["queryNonce"],
+                "expiresAtEpochMillis": request["expiresAtEpochMillis"],
+            });
+            drop(
+                authorizer
+                    .write_all(format!("{late_ack}\n").as_bytes())
+                    .await,
+            );
+            let mut unexpected_second_request = Vec::new();
+            drop(authorizer.read_to_end(&mut unexpected_second_request).await);
+            unexpected_second_request
+        });
+
+        assert!(
+            client
+                .authorize_with_timeout(
+                    &"a".repeat(64),
+                    &"b".repeat(64),
+                    std::time::Duration::from_millis(10),
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.is_poisoned());
+        assert!(
+            client
+                .authorize_with_timeout(
+                    &"a".repeat(64),
+                    &"c".repeat(64),
+                    std::time::Duration::from_millis(10),
+                )
+                .await
+                .is_err()
+        );
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_ack_timeout_poisons_the_shared_channel() {
+        let (client_stream, mut authorizer) = UnixStream::pair().unwrap();
+        let client = Arc::new(QueryAuthorizationClient::new(client_stream));
+        let server = tokio::spawn(async move {
+            let mut request = String::new();
+            BufReader::new(&mut authorizer)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            authorizer.write_all(b"{\"ok\":true").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        });
+
+        assert!(
+            client
+                .authorize_with_timeout(
+                    &"a".repeat(64),
+                    &"b".repeat(64),
+                    std::time::Duration::from_millis(10),
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.is_poisoned());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_for_a_different_query_nonce_is_rejected() {
+        let (client_stream, mut authorizer) = UnixStream::pair().unwrap();
+        let client = Arc::new(QueryAuthorizationClient::new(client_stream));
+        let server = tokio::spawn(async move {
+            let mut request = String::new();
+            BufReader::new(&mut authorizer)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            let request = serde_json::from_str::<Value>(request.trim()).unwrap();
+            let wrong_ack = json!({
+                "ok": true,
+                "authorized": true,
+                "workerInstance": request["workerInstance"],
+                "turnBinding": request["turnBinding"],
+                "queryNonce": "f".repeat(32),
+                "expiresAtEpochMillis": request["expiresAtEpochMillis"],
+            });
+            authorizer
+                .write_all(format!("{wrong_ack}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        assert!(
+            client
+                .authorize_with_timeout(
+                    &"a".repeat(64),
+                    &"b".repeat(64),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.is_poisoned());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_authorization_attempt_poisons_the_shared_channel() {
+        let (client_stream, mut authorizer) = UnixStream::pair().unwrap();
+        let client = Arc::new(QueryAuthorizationClient::new(client_stream));
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut request = String::new();
+            BufReader::new(&mut authorizer)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            request_seen_tx.send(()).unwrap();
+            let mut remainder = Vec::new();
+            authorizer.read_to_end(&mut remainder).await.unwrap();
+        });
+        let task_client = Arc::clone(&client);
+        let task = tokio::spawn(async move {
+            task_client
+                .authorize(&"a".repeat(64), &"b".repeat(64))
+                .await
+        });
+        request_seen_rx.await.unwrap();
+        task.abort();
+        drop(task.await);
+        assert!(client.is_poisoned());
+        assert!(
+            client
+                .authorize_with_timeout(
+                    &"a".repeat(64),
+                    &"c".repeat(64),
+                    std::time::Duration::from_millis(10),
+                )
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
     }
 }
