@@ -26,10 +26,8 @@ use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
 };
-use codex_protocol::{
-    ThreadId,
-    protocol::{InitialHistory, SessionSource},
-};
+use codex_protocol::{ThreadId, mcp::ClientMcpExtensions, protocol::SessionSource};
+use codex_rollout::InitialHistory;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::{
     collections::HashMap,
@@ -75,7 +73,9 @@ impl CodexAgent {
         codex_linux_sandbox_exe: Option<PathBuf>,
         restricted: Option<Arc<RestrictedRuntime>>,
     ) -> std::io::Result<Self> {
-        let auth_manager = AuthManager::shared_from_config(&config, false).await;
+        let auth_manager = AuthManager::shared_from_config(&config, false)
+            .await
+            .map_err(std::io::Error::other)?;
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
@@ -378,6 +378,7 @@ impl CodexAgent {
                                     Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
                                 },
                                 env_http_headers: None,
+                                http_headers_helper: None,
                             },
                             auth: Default::default(),
                             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
@@ -395,6 +396,7 @@ impl CodexAgent {
                             tools: Default::default(),
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
+                            omit_tools_from: None,
                         },
                     );
                 }
@@ -437,6 +439,7 @@ impl CodexAgent {
                             tools: Default::default(),
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
+                            omit_tools_from: None,
                         },
                     );
                 }
@@ -464,7 +467,6 @@ impl CodexAgent {
         let InitializeRequest {
             protocol_version,
             client_capabilities,
-            client_info: _, // TODO: save and pass into Codex somehow
             ..
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
@@ -770,7 +772,7 @@ impl CodexAgent {
             rollout_path,
             self.auth_manager.clone(),
             None,
-            false,
+            ClientMcpExtensions::default(),
         ))
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -893,8 +895,8 @@ impl CodexAgent {
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
-        if self.restricted.is_some() {
-            if request.meta.is_some()
+        if self.restricted.is_some()
+            && (request.meta.is_some()
                 || request.prompt.is_empty()
                 || request.prompt.len() > 8
                 || request
@@ -909,11 +911,11 @@ impl CodexAgent {
                         _ => None,
                     })
                     .sum::<usize>()
-                    > 32_000
-            {
-                return Err(Error::invalid_params()
-                    .data("restricted prompts permit only bounded text blocks"));
-            }
+                    > 32_000)
+        {
+            return Err(
+                Error::invalid_params().data("restricted prompts permit only bounded text blocks")
+            );
         }
         // Check before sending if authentication was successful or not
         self.check_auth().await?;

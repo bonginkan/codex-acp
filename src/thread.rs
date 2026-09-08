@@ -64,19 +64,20 @@ use codex_protocol::{
         McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
-        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, StreamErrorEvent, TerminalInteractionEvent,
+        ThreadGoalStatus, ThreadGoalUpdatedEvent, ThreadSettingsOverrides, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
     },
     review_format::format_review_findings_block,
+    turn_input::{TurnInputMode, TurnInputRequest, TurnInputSubmission},
     user_input::UserInput,
 };
+use codex_rollout::RolloutItem;
 use codex_shell_command::parse_command::parse_command;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
@@ -424,6 +425,7 @@ pub struct Thread {
 }
 
 impl Thread {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
@@ -1042,7 +1044,7 @@ impl PromptState {
             // of a successful `StopReason` and a synthesized error for the failure
             // case (the authoritative error is delivered to the primary responder).
             let steer_result = match &result {
-                Ok(stop_reason) => Ok(stop_reason.clone()),
+                Ok(stop_reason) => Ok(*stop_reason),
                 Err(_) => Err(Error::internal_error().data("steered turn failed")),
             };
             drop(steer_tx.send(steer_result));
@@ -1288,7 +1290,6 @@ impl PromptState {
                 model_context_window,
                 collaboration_mode_kind,
                 turn_id,
-                started_at: _,
                 ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
@@ -1312,9 +1313,6 @@ impl PromptState {
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
-                images: _,
-                text_elements: _,
-                local_images: _,
                 ..
             }) => {
                 if client.restricted {
@@ -1372,7 +1370,7 @@ impl PromptState {
                     client.send_agent_thought("\n\n");
                 }
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
                 if client.restricted {
                     info!(message_length = message.len(), "restricted agent message received");
                 } else {
@@ -1491,7 +1489,6 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
-                mcp_app_resource_uri: _,
                 ..
             }) => {
                 info!(
@@ -1505,7 +1502,6 @@ impl PromptState {
                 invocation,
                 duration,
                 result,
-                mcp_app_resource_uri: _,
                 ..
             }) => {
                 info!(
@@ -1582,6 +1578,7 @@ impl PromptState {
             EventMsg::Error(ErrorEvent {
                 message,
                 codex_error_info,
+                ..
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.detach_pending_interactions();
@@ -1710,6 +1707,9 @@ impl PromptState {
             // rust-v0.146.0 で追加。ACP 側に対応する通知が無いため無視する。
             | EventMsg::EnvironmentConnected(..)
             | EventMsg::EnvironmentDisconnected(..)
+            | EventMsg::AuthRecoveryStarted(..)
+            | EventMsg::AuthRecoveryCompleted(..)
+            | EventMsg::ThreadQueueChanged(..)
             | EventMsg::RawResponseCompleted(..)
             | EventMsg::PlanDelta(..)=> {}
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
@@ -1757,7 +1757,9 @@ impl PromptState {
         }
 
         let request_kind = match &request {
-            ElicitationRequest::Form { .. } | ElicitationRequest::OpenAiForm { .. } => "form",
+            ElicitationRequest::Form { .. }
+            | ElicitationRequest::OpenAiForm { .. }
+            | ElicitationRequest::OpenAiElicitationForm { .. } => "form",
             ElicitationRequest::Url { .. } => "url",
         };
 
@@ -1822,9 +1824,6 @@ impl PromptState {
             call_id,
             changes,
             reason,
-            // grant_root doesn't seem to be set anywhere on the codex side
-            grant_root: _,
-            turn_id: _,
             ..
         } = event;
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
@@ -2091,7 +2090,7 @@ impl PromptState {
             file_extension,
             locations,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
+        } = parse_command_tool_call(parsed_cmd, &legacy_cwd_to_path(&cwd));
         self.active_commands.insert(
             call_id.clone(),
             ActiveCommand {
@@ -2205,7 +2204,7 @@ impl PromptState {
             locations,
             terminal_output,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
+        } = parse_command_tool_call(parsed_cmd, &path_uri_to_path(&cwd));
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
@@ -2409,6 +2408,7 @@ impl PromptState {
             revised_prompt,
             result,
             saved_path,
+            ..
         } = event;
         let tool_status = image_generation_tool_status(&status);
         let saved_path = saved_path.map(|path| path.to_string_lossy().into_owned());
@@ -2491,7 +2491,6 @@ impl PromptState {
             turn_id: _,
             reason,
             permissions,
-            cwd: _,
             ..
         } = event;
 
@@ -2694,6 +2693,15 @@ fn build_exec_permission_options(
                 ),
                 decision: ReviewDecision::ApprovedForSession,
             },
+            ReviewDecision::ApprovedMcpPolicyAmendment => ExecPermissionOption {
+                option_id: "approved-mcp-policy-amendment",
+                permission_option: PermissionOption::new(
+                    "approved-mcp-policy-amendment",
+                    "Yes, and remember this MCP policy",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                decision: ReviewDecision::ApprovedMcpPolicyAmendment,
+            },
             ReviewDecision::NetworkPolicyAmendment {
                 network_policy_amendment,
             } => {
@@ -2757,6 +2765,18 @@ struct ParseCommandToolCall {
     terminal_output: bool,
     locations: Vec<ToolCallLocation>,
     kind: ToolKind,
+}
+
+fn legacy_cwd_to_path(cwd: &codex_utils_path_uri::LegacyAppPathString) -> PathBuf {
+    cwd.to_inferred_abs_path()
+        .map(|path| path.as_path().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(cwd.render_for_ui()))
+}
+
+fn path_uri_to_path(cwd: &codex_utils_path_uri::PathUri) -> PathBuf {
+    cwd.to_abs_path()
+        .map(|path| path.as_path().to_path_buf())
+        .unwrap_or_else(|_| PathBuf::from(cwd.inferred_native_path_string()))
 }
 
 fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseCommandToolCall {
@@ -3483,32 +3503,29 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
+        enum PromptAction {
+            Core(Box<Op>),
+            Turn {
+                request: Box<TurnInputRequest>,
+                allow_steer: bool,
+            },
+        }
+
         let items = build_prompt_items(request.prompt);
-        let op;
-        // Whether this prompt is a recognized slash command that starts or
-        // replaces a turn (e.g. /compact, /init, /review). Such commands are
-        // never steered mid-turn — injecting them into a running turn's pending
-        // input would mis-fire, so they fall through to the default path and let
-        // codex-core serialize them. Plain text (and unrecognized "/foo") steers.
-        let mut is_turn_command = false;
+        let action;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => {
-                    op = Op::Compact;
-                    is_turn_command = true;
+                    action = PromptAction::Core(Box::new(Op::Compact));
                 }
                 "init" => {
-                    is_turn_command = true;
-                    op = Op::UserInput {
-                        items: vec![UserInput::Text {
+                    action = PromptAction::Turn {
+                        request: Box::new(TurnInputRequest::user_input(vec![UserInput::Text {
                             text: INIT_COMMAND_PROMPT.into(),
                             text_elements: vec![],
-                        }],
-                        final_output_json_schema: None,
-                        additional_context: Default::default(),
-                        responsesapi_client_metadata: None,
-                        thread_settings: Default::default(),
-                    }
+                        }])),
+                        allow_steer: false,
+                    };
                 }
                 "review" => {
                     let instructions = rest.trim();
@@ -3520,102 +3537,130 @@ impl<A: Auth> ThreadActor<A> {
                         }
                     };
 
-                    op = Op::Review {
+                    action = PromptAction::Core(Box::new(Op::Review {
                         review_request: ReviewRequest {
                             user_facing_hint: Some(user_facing_hint(&target)),
                             target,
                         },
-                    };
-                    is_turn_command = true;
+                    }));
                 }
                 "review-branch" if !rest.is_empty() => {
                     let target = ReviewTarget::BaseBranch {
                         branch: rest.trim().to_owned(),
                     };
-                    op = Op::Review {
+                    action = PromptAction::Core(Box::new(Op::Review {
                         review_request: ReviewRequest {
                             user_facing_hint: Some(user_facing_hint(&target)),
                             target,
                         },
-                    };
-                    is_turn_command = true;
+                    }));
                 }
                 "review-commit" if !rest.is_empty() => {
                     let target = ReviewTarget::Commit {
                         sha: rest.trim().to_owned(),
                         title: None,
                     };
-                    op = Op::Review {
+                    action = PromptAction::Core(Box::new(Op::Review {
                         review_request: ReviewRequest {
                             user_facing_hint: Some(user_facing_hint(&target)),
                             target,
                         },
-                    };
-                    is_turn_command = true;
+                    }));
                 }
                 "logout" => {
                     self.auth.logout().await?;
                     return Err(Error::auth_required());
                 }
                 _ => {
-                    op = Op::UserInput {
-                        items,
-                        final_output_json_schema: None,
-                        additional_context: Default::default(),
-                        responsesapi_client_metadata: None,
-                        thread_settings: Default::default(),
-                    }
+                    action = PromptAction::Turn {
+                        request: Box::new(TurnInputRequest::user_input(items)),
+                        allow_steer: true,
+                    };
                 }
             }
         } else {
-            op = Op::UserInput {
-                items,
-                final_output_json_schema: None,
-                additional_context: Default::default(),
-                responsesapi_client_metadata: None,
-                thread_settings: Default::default(),
-            }
+            action = PromptAction::Turn {
+                request: Box::new(TurnInputRequest::user_input(items)),
+                allow_steer: true,
+            };
         }
 
-        // TRUE mid-turn steering ("dissolve into current turn"): if a prompt turn
-        // is already in flight and this is plain user input (not a turn-starting
-        // slash command), submit it as `Op::UserInput` so codex-core's
-        // `submission_loop` routes it to `Session::steer_input()` and injects it
-        // into the running turn's pending input. We do NOT register an independent
-        // turn for it; instead its ACP response is attached to the live turn's
-        // submission and resolves with that shared turn's terminal `StopReason`.
-        if !is_turn_command
-            && self
-                .submissions
-                .values()
-                .any(|submission| submission.is_active())
-        {
-            let submission_id = self
+        let submission_id = match action {
+            PromptAction::Core(op) => self
                 .thread
-                .submit(op)
+                .submit(*op)
                 .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-            info!(
-                "Steered into in-flight turn; steer submission_id: {submission_id} (response dissolves into running turn)"
-            );
-            // Attach to the live turn so the steered prompt resolves with the
-            // shared turn's terminal StopReason. The `is_active()` check above
-            // guarantees such a submission exists.
-            if let Some(active) = self
-                .submissions
-                .values_mut()
-                .find(|submission| submission.is_active())
-            {
-                active.attach_steer(response_tx);
+                .map_err(|error| Error::internal_error().data(error.to_string()))?,
+            PromptAction::Turn {
+                request,
+                allow_steer: true,
+            } => {
+                let (route_tx, route_rx) = oneshot::channel();
+                self.thread
+                    .submit(Op::TurnInput {
+                        request,
+                        mode: TurnInputMode::StartOrSteer,
+                        reply: route_tx,
+                    })
+                    .await
+                    .map_err(|error| Error::internal_error().data(error.to_string()))?;
+                match route_rx
+                    .await
+                    .map_err(|_| Error::internal_error().data("turn routing reply was lost"))?
+                    .map_err(|error| Error::internal_error().data(error.to_string()))?
+                {
+                    TurnInputSubmission::Started { turn_id } => turn_id,
+                    TurnInputSubmission::Steered { turn_id } => {
+                        info!(
+                            "Steered into in-flight turn; turn_id: {turn_id} (response dissolves into running turn)"
+                        );
+                        let active = self
+                            .submissions
+                            .values_mut()
+                            .find(|submission| submission.is_active())
+                            .ok_or_else(|| {
+                                Error::internal_error()
+                                    .data("Codex accepted a steer without an active ACP submission")
+                            })?;
+                        active.attach_steer(response_tx);
+                        return Ok(response_rx);
+                    }
+                    TurnInputSubmission::NotSubmitted { reason } => {
+                        return Err(Error::internal_error()
+                            .data(format!("prompt was not submitted: {reason:?}")));
+                    }
+                }
             }
-            return Ok(response_rx);
-        }
-
-        let submission_id = self
-            .thread
-            .submit(op.clone())
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            PromptAction::Turn {
+                request,
+                allow_steer: false,
+            } => {
+                let (route_tx, route_rx) = oneshot::channel();
+                self.thread
+                    .submit(Op::TurnInput {
+                        request,
+                        mode: TurnInputMode::StartIfIdle,
+                        reply: route_tx,
+                    })
+                    .await
+                    .map_err(|error| Error::internal_error().data(error.to_string()))?;
+                match route_rx
+                    .await
+                    .map_err(|_| Error::internal_error().data("turn routing reply was lost"))?
+                    .map_err(|error| Error::internal_error().data(error.to_string()))?
+                {
+                    TurnInputSubmission::Started { turn_id } => turn_id,
+                    TurnInputSubmission::Steered { .. } => {
+                        return Err(Error::internal_error()
+                            .data("start-if-idle unexpectedly steered an active turn"));
+                    }
+                    TurnInputSubmission::NotSubmitted { reason } => {
+                        return Err(Error::internal_error()
+                            .data(format!("turn command was not submitted: {reason:?}")));
+                    }
+                }
+            }
+        };
 
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
@@ -3766,11 +3811,7 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                 self.client.send_user_message(message.clone());
             }
-            EventMsg::AgentMessage(AgentMessageEvent {
-                message,
-                phase: _,
-                memory_citation: _,
-            }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
                 self.client.send_agent_text(message.clone());
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
@@ -3955,11 +3996,14 @@ impl<A: Auth> ThreadActor<A> {
                 );
             }
             ResponseItem::FunctionCallOutput {
-                call_id, output, ..
+                call_id: Some(call_id),
+                output,
+                ..
             } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok());
             }
+            ResponseItem::FunctionCallOutput { call_id: None, .. } => {}
             ResponseItem::LocalShellCall {
                 call_id: Some(call_id),
                 action,
@@ -4318,6 +4362,9 @@ fn guardian_action_summary(action: &GuardianAssessmentAction) -> Option<String> 
                 .unwrap_or_else(|| command.join(" "));
             Some(format!("{label} {joined}"))
         }
+        GuardianAssessmentAction::WriteStdin { process_id, .. } => {
+            Some(format!("write stdin to process {process_id}"))
+        }
         GuardianAssessmentAction::ApplyPatch { files, cwd: _ } => Some(if files.len() == 1 {
             format!("apply_patch touching {}", files[0].display())
         } else {
@@ -4362,7 +4409,7 @@ fn format_file_system_entries<'a>(
 
 fn format_file_system_entry(entry: &FileSystemSandboxEntry) -> String {
     match &entry.path {
-        FileSystemPath::Path { path } => path.display().to_string(),
+        FileSystemPath::Path { path } => path.inferred_native_path_string(),
         FileSystemPath::GlobPattern { pattern } => format!("glob `{pattern}`"),
         FileSystemPath::Special { value } => format_file_system_special(value),
     }
@@ -4520,6 +4567,14 @@ mod tests {
 
     use super::*;
 
+    fn legacy_test_cwd() -> codex_utils_path_uri::LegacyAppPathString {
+        codex_utils_path_uri::PathUri::from_host_native_path(
+            std::env::current_dir().expect("current directory"),
+        )
+        .expect("valid current directory")
+        .into()
+    }
+
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
@@ -4570,7 +4625,7 @@ mod tests {
             assert_eq!(ops.len(), 2);
             assert!(matches!(
                 &ops[1],
-                Op::UserInput { items, .. }
+                RecordedOp::TurnInput { items, mode: TurnInputMode::StartOrSteer }
                     if matches!(items.as_slice(), [UserInput::Text { text, .. }] if text == "steered input")
             ));
         }
@@ -4723,7 +4778,7 @@ mod tests {
             }) if text == "Compact task completed"
         ));
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(ops.as_slice(), &[Op::Compact]);
+        assert!(matches!(ops.as_slice(), [RecordedOp::Compact]));
 
         Ok(())
     }
@@ -4845,18 +4900,14 @@ mod tests {
             "notifications don't match {notifications:?}"
         );
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(
-            ops.as_slice(),
-            &[Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: INIT_COMMAND_PROMPT.to_string(),
-                    text_elements: vec![]
-                }],
-                final_output_json_schema: None,
-                additional_context: Default::default(),
-                responsesapi_client_metadata: None,
-                thread_settings: Default::default(),
-            }],
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [RecordedOp::TurnInput {
+                    items,
+                    mode: TurnInputMode::StartIfIdle,
+                }] if matches!(items.as_slice(), [UserInput::Text { text, .. }] if text == INIT_COMMAND_PROMPT)
+            ),
             "ops don't match {ops:?}"
         );
 
@@ -4891,14 +4942,14 @@ mod tests {
         );
 
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(
-            ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::UncommittedChanges)),
-                    target: ReviewTarget::UncommittedChanges,
-                }
-            }],
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [RecordedOp::Review { review_request }]
+                    if review_request.target == ReviewTarget::UncommittedChanges
+                        && review_request.user_facing_hint
+                            == Some(user_facing_hint(&ReviewTarget::UncommittedChanges))
+            ),
             "ops don't match {ops:?}"
         );
 
@@ -4937,18 +4988,16 @@ mod tests {
         );
 
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(
-            ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::Custom {
-                        instructions: instructions.to_owned()
-                    })),
-                    target: ReviewTarget::Custom {
-                        instructions: instructions.to_owned()
-                    },
-                }
-            }],
+        let expected_target = ReviewTarget::Custom {
+            instructions: instructions.to_owned(),
+        };
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [RecordedOp::Review { review_request }]
+                    if review_request.target == expected_target
+                        && review_request.user_facing_hint == Some(user_facing_hint(&expected_target))
+            ),
             "ops don't match {ops:?}"
         );
 
@@ -4983,20 +5032,17 @@ mod tests {
         );
 
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(
-            ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::Commit {
-                        sha: "123456".to_owned(),
-                        title: None
-                    })),
-                    target: ReviewTarget::Commit {
-                        sha: "123456".to_owned(),
-                        title: None
-                    },
-                }
-            }],
+        let expected_target = ReviewTarget::Commit {
+            sha: "123456".to_owned(),
+            title: None,
+        };
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [RecordedOp::Review { review_request }]
+                    if review_request.target == expected_target
+                        && review_request.user_facing_hint == Some(user_facing_hint(&expected_target))
+            ),
             "ops don't match {ops:?}"
         );
 
@@ -5031,18 +5077,16 @@ mod tests {
         );
 
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(
-            ops.as_slice(),
-            &[Op::Review {
-                review_request: ReviewRequest {
-                    user_facing_hint: Some(user_facing_hint(&ReviewTarget::BaseBranch {
-                        branch: "feature".to_owned()
-                    })),
-                    target: ReviewTarget::BaseBranch {
-                        branch: "feature".to_owned()
-                    },
-                }
-            }],
+        let expected_target = ReviewTarget::BaseBranch {
+            branch: "feature".to_owned(),
+        };
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [RecordedOp::Review { review_request }]
+                    if review_request.target == expected_target
+                        && review_request.user_facing_hint == Some(user_facing_hint(&expected_target))
+            ),
             "ops don't match {ops:?}"
         );
 
@@ -5147,9 +5191,35 @@ mod tests {
     struct StubCodexThread {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
-        ops: std::sync::Mutex<Vec<Op>>,
+        ops: std::sync::Mutex<Vec<RecordedOp>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
+    }
+
+    #[derive(Debug)]
+    enum RecordedOp {
+        TurnInput {
+            items: Vec<UserInput>,
+            mode: TurnInputMode,
+        },
+        Compact,
+        Review {
+            review_request: ReviewRequest,
+        },
+        ExecApproval {
+            id: String,
+            turn_id: Option<String>,
+            decision: ReviewDecision,
+        },
+        ResolveElicitation {
+            server_name: String,
+            request_id: codex_protocol::mcp::RequestId,
+            decision: ElicitationAction,
+            content: Option<serde_json::Value>,
+            meta: Option<serde_json::Value>,
+        },
+        Shutdown,
+        Other,
     }
 
     impl StubCodexThread {
@@ -5175,10 +5245,88 @@ mod tests {
                     .current_id
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                self.ops.lock().unwrap().push(op.clone());
+                let recorded_op = match &op {
+                    Op::TurnInput { request, mode, .. } => {
+                        let items = match &request.input {
+                            codex_protocol::turn_input::TurnInput::UserInput {
+                                content, ..
+                            } => content.clone(),
+                            _ => vec![],
+                        };
+                        RecordedOp::TurnInput {
+                            items,
+                            mode: mode.clone(),
+                        }
+                    }
+                    Op::Compact => RecordedOp::Compact,
+                    Op::Review { review_request } => RecordedOp::Review {
+                        review_request: review_request.clone(),
+                    },
+                    Op::ExecApproval {
+                        id,
+                        turn_id,
+                        decision,
+                    } => RecordedOp::ExecApproval {
+                        id: id.clone(),
+                        turn_id: turn_id.clone(),
+                        decision: decision.clone(),
+                    },
+                    Op::ResolveElicitation {
+                        server_name,
+                        request_id,
+                        decision,
+                        content,
+                        meta,
+                    } => RecordedOp::ResolveElicitation {
+                        server_name: server_name.clone(),
+                        request_id: request_id.clone(),
+                        decision: *decision,
+                        content: content.clone(),
+                        meta: meta.clone(),
+                    },
+                    Op::Shutdown => RecordedOp::Shutdown,
+                    _ => RecordedOp::Other,
+                };
+                self.ops.lock().unwrap().push(recorded_op);
 
                 match op {
-                    Op::UserInput { items, .. } => {
+                    Op::TurnInput {
+                        request,
+                        mode,
+                        reply,
+                    } => {
+                        let items = match request.input {
+                            codex_protocol::turn_input::TurnInput::UserInput {
+                                content, ..
+                            } => content,
+                            _ => unimplemented!(),
+                        };
+                        let active_prompt_id = self.active_prompt_id.lock().unwrap().clone();
+                        let route = match (&mode, active_prompt_id) {
+                            (TurnInputMode::StartOrSteer, Some(turn_id))
+                            | (TurnInputMode::Steer { .. }, Some(turn_id)) => {
+                                TurnInputSubmission::Steered { turn_id }
+                            }
+                            (TurnInputMode::StartIfIdle, Some(_)) => {
+                                TurnInputSubmission::NotSubmitted {
+                                    reason: codex_protocol::turn_input::NotSubmittedReason::NotIdle,
+                                }
+                            }
+                            (TurnInputMode::Steer { .. }, None) => {
+                                TurnInputSubmission::NotSubmitted {
+                                    reason:
+                                        codex_protocol::turn_input::NotSubmittedReason::NoActiveTurn,
+                                }
+                            }
+                            (_, None) => TurnInputSubmission::Started {
+                                turn_id: id.to_string(),
+                            },
+                        };
+                        let started = matches!(route, TurnInputSubmission::Started { .. });
+                        reply.send(Ok(route)).unwrap();
+                        if !started {
+                            return Ok(id.to_string());
+                        }
                         *self.active_prompt_id.lock().unwrap() = Some(id.to_string());
                         let prompt = items
                             .into_iter()
@@ -5302,6 +5450,8 @@ mod tests {
                                 status: "completed".into(),
                                 revised_prompt: Some("A tiny blue square".into()),
                                 result: "Zm9v".into(),
+                                transparent_background: None,
+                                failure: None,
                                 saved_path: Some(saved_path.try_into()?),
                             }));
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -5356,6 +5506,7 @@ mod tests {
                                 .send(Event {
                                     id: id.to_string(),
                                     msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                                        kind: Default::default(),
                                         call_id: "call-id".to_string(),
                                         plugin_id: None,
                                         script_path: None,
@@ -5364,7 +5515,7 @@ mod tests {
                                         environment_id: None,
                                         started_at_ms: 0,
                                         command: vec!["echo".to_string(), "hi".to_string()],
-                                        cwd: std::env::current_dir().unwrap().try_into().unwrap(),
+                                        cwd: legacy_test_cwd(),
                                         reason: None,
                                         network_approval_context: None,
                                         proposed_execpolicy_amendment: None,
@@ -5402,6 +5553,8 @@ mod tests {
                                         message: prompt,
                                         phase: None,
                                         memory_citation: None,
+                                        delivery: None,
+                                        questions: None,
                                     }),
                                 })
                                 .unwrap();
@@ -5441,6 +5594,8 @@ mod tests {
                                     message: "Compact task completed".to_string(),
                                     phase: None,
                                     memory_citation: None,
+                                    delivery: None,
+                                    questions: None,
                                 }),
                             })
                             .unwrap();
@@ -5705,6 +5860,7 @@ mod tests {
         prompt_state.exec_approval(
             &session_client,
             ExecApprovalRequestEvent {
+                kind: Default::default(),
                 call_id: "call-id".to_string(),
                 plugin_id: None,
                 script_path: None,
@@ -5713,7 +5869,7 @@ mod tests {
                 environment_id: None,
                 started_at_ms: 0,
                 command: vec!["echo".to_string(), "hi".to_string()],
-                cwd: std::env::current_dir()?.try_into()?,
+                cwd: legacy_test_cwd(),
                 reason: None,
                 network_approval_context: None,
                 proposed_execpolicy_amendment: None,
@@ -5762,7 +5918,7 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert!(matches!(
             ops.last(),
-            Some(Op::ExecApproval {
+            Some(RecordedOp::ExecApproval {
                 id,
                 turn_id,
                 decision: ReviewDecision::Denied { rejection },
@@ -5866,9 +6022,9 @@ mod tests {
             )
             .await?;
 
-        let op = thread.ops.lock().unwrap().last().cloned().unwrap();
-        match op {
-            Op::ResolveElicitation {
+        let ops = thread.ops.lock().unwrap();
+        match ops.last().unwrap() {
+            RecordedOp::ResolveElicitation {
                 server_name,
                 request_id: codex_protocol::mcp::RequestId::String(id),
                 decision,
@@ -5876,8 +6032,8 @@ mod tests {
                 meta,
             } => {
                 assert_eq!(server_name, "test-server");
-                assert_eq!(id, request_id);
-                assert_eq!(decision, ElicitationAction::Accept);
+                assert_eq!(id, &request_id);
+                assert_eq!(*decision, ElicitationAction::Accept);
                 assert!(content.is_none());
                 assert_eq!(
                     meta.as_ref()
@@ -5941,7 +6097,7 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert!(matches!(
             ops.last(),
-            Some(Op::ResolveElicitation {
+            Some(RecordedOp::ResolveElicitation {
                 server_name,
                 request_id: codex_protocol::mcp::RequestId::String(request_id),
                 decision: ElicitationAction::Decline,
@@ -5972,6 +6128,7 @@ mod tests {
             .handle_event(
                 &session_client,
                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                    kind: Default::default(),
                     call_id: "call-id".to_string(),
                     plugin_id: None,
                     script_path: None,
@@ -5980,7 +6137,7 @@ mod tests {
                     environment_id: None,
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
-                    cwd: std::env::current_dir()?.try_into()?,
+                    cwd: legacy_test_cwd(),
                     reason: None,
                     network_approval_context: None,
                     proposed_execpolicy_amendment: None,
@@ -6004,6 +6161,8 @@ mod tests {
                     message: "still flowing".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
+                    questions: None,
                 }),
             )
             .await;
@@ -6051,6 +6210,7 @@ mod tests {
             .handle_event(
                 &session_client,
                 EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                    kind: Default::default(),
                     call_id: "call-id".to_string(),
                     plugin_id: None,
                     script_path: None,
@@ -6059,7 +6219,7 @@ mod tests {
                     environment_id: None,
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
-                    cwd: std::env::current_dir()?.try_into()?,
+                    cwd: legacy_test_cwd(),
                     reason: None,
                     network_approval_context: None,
                     proposed_execpolicy_amendment: None,
@@ -6183,7 +6343,7 @@ mod tests {
         notify.notify_one();
 
         let ops = conversation.ops.lock().unwrap();
-        assert!(matches!(ops.last(), Some(Op::Shutdown)));
+        assert!(matches!(ops.last(), Some(RecordedOp::Shutdown)));
 
         Ok(())
     }

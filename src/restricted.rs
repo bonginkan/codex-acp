@@ -32,8 +32,8 @@ pub const RESTRICTED_MCP_NAME: &str = "ninna_inquiry";
 pub const RESTRICTED_MCP_COMMAND: &str = "/usr/local/libexec/ninna-mcp-launch";
 pub const RESTRICTED_MCP_ARGS: [&str; 2] = ["serve", "--socket=/run/ninna/query.sock"];
 pub const REQUIREMENTS_PATH: &str = "/etc/codex/requirements.toml";
-pub const EMBEDDED_CODEX_TAG: &str = "rust-v0.146.0";
-pub const EMBEDDED_CODEX_COMMIT: &str = "e363b08c9175ac1cbe5893615dd2cb9ddf95043b";
+pub const EMBEDDED_CODEX_TAG: &str = "rust-v0.153.4";
+pub const EMBEDDED_CODEX_COMMIT: &str = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a";
 pub const RESTRICTED_MODEL: &str = "gpt-6-astra";
 pub const RESTRICTED_MODEL_PROVIDER: &str = "openai";
 pub const RESTRICTED_REASONING_EFFORT: &str = "xhigh";
@@ -340,15 +340,15 @@ impl ConfigSnapshot {
                 .non_prefixed_mcp_tool_servers
                 .clone()
                 .unwrap_or_default(),
-            config_lock_export_configured: config.config_lock_export_dir.is_some(),
+            // These legacy remote/export endpoints are absent from Codex 0.153.4.
+            config_lock_export_configured: false,
             bypass_hook_trust: config.bypass_hook_trust,
             forced_login_method: serde_json::to_value(config.forced_login_method)
                 .map_err(|error| error.to_string())?,
             mcp_oauth_callback_configured: config.mcp_oauth_callback_port.is_some()
                 || config.mcp_oauth_callback_url.is_some(),
             apps_mcp_product_sku_configured: config.apps_mcp_product_sku.is_some(),
-            experimental_remote_configured: config.experimental_thread_config_endpoint.is_some()
-                || config.experimental_realtime_ws_base_url.is_some()
+            experimental_remote_configured: config.experimental_realtime_ws_base_url.is_some()
                 || config.experimental_realtime_webrtc_call_base_url.is_some()
                 || config.experimental_realtime_ws_model.is_some()
                 || config.experimental_realtime_ws_backend_prompt.is_some()
@@ -512,7 +512,7 @@ fn restricted_permission_profile_is_exact(config: &Config) -> bool {
     let denied_path = |required: &Path| {
         entries.iter().any(|entry| {
             entry.access == FileSystemAccessMode::Deny
-                && matches!(&entry.path, FileSystemPath::Path { path } if path.as_path() == required)
+                && matches!(&entry.path, FileSystemPath::Path { path } if path.to_abs_path().is_ok_and(|path| path.as_path() == required))
         })
     };
     has_minimal_read
