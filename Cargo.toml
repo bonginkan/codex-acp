@@ -17,6 +17,10 @@ doctest = false
 name = "codex_acp"
 path = "src/lib.rs"
 
+[features]
+default = []
+ninna-validation-attestation = []
+
 [dependencies]
 agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }
 anyhow = "1"
