@@ -45,6 +45,8 @@ pub const RESTRICTED_SERVICE_TIER: &str = "priority";
 const VALIDATION_PROVENANCE: &str = "synthetic_slack_api_fixture";
 #[cfg(feature = "ninna-validation-attestation")]
 const VALIDATION_CLASSIFICATION: &str = "SYNTHETIC_SHARED_PATH_ONLY";
+#[cfg(feature = "ninna-validation-attestation")]
+const VALIDATION_PROFILE_WIRE_VALUES: [&str; 2] = ["inquiry.member", "inquiry.external"];
 
 #[cfg(feature = "ninna-validation-attestation")]
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -109,14 +111,8 @@ impl ValidationSessionBinding {
         }
         validate_lower_hex("openabSourceCommit", &self.openab_source_commit, 40)?;
         validate_lower_hex("acpSourceCommit", &self.acp_source_commit, 40)?;
-        if self.profile.is_empty()
-            || self.profile.len() > 64
-            || !self
-                .profile
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
-            return Err("validation binding profile is not a bounded identifier".into());
+        if !VALIDATION_PROFILE_WIRE_VALUES.contains(&self.profile.as_str()) {
+            return Err("validation binding profile is not an inquiry wire value".into());
         }
         if self.acp_source_commit != expected_acp_source_commit {
             return Err("validation binding ACP source commit differs from this binary".into());
@@ -1030,7 +1026,7 @@ mod tests {
 
     #[cfg(feature = "ninna-validation-attestation")]
     #[test]
-    fn validation_binding_is_deny_unknown_and_requires_exact_literals() {
+    fn validation_binding_accepts_exact_inquiry_wire_profiles_only() {
         let mut value = json!({
             "schemaVersion": 1,
             "validationProvenance": VALIDATION_PROVENANCE,
@@ -1044,13 +1040,29 @@ mod tests {
             "fixtureSha256": "f".repeat(64),
             "sessionKeyHash": "1".repeat(64),
             "principalHash": "2".repeat(64),
-            "profile": "inquiry_private",
+            "profile": "inquiry.member",
             "destinationFingerprint": "3".repeat(64)
         });
-        let binding = serde_json::from_value::<ValidationSessionBinding>(value.clone()).unwrap();
-        binding
-            .validate_identity(env!("NINNA_SOURCE_COMMIT"), &"e".repeat(64))
-            .unwrap();
+        for profile in VALIDATION_PROFILE_WIRE_VALUES {
+            value["profile"] = json!(profile);
+            let binding =
+                serde_json::from_value::<ValidationSessionBinding>(value.clone()).unwrap();
+            binding
+                .validate_identity(env!("NINNA_SOURCE_COMMIT"), &"e".repeat(64))
+                .unwrap();
+        }
+
+        for unknown in ["inquiry_private", "inquiry.unknown", "operations"] {
+            value["profile"] = json!(unknown);
+            assert!(
+                serde_json::from_value::<ValidationSessionBinding>(value.clone())
+                    .unwrap()
+                    .validate_identity(env!("NINNA_SOURCE_COMMIT"), &"e".repeat(64))
+                    .is_err()
+            );
+        }
+
+        value["profile"] = json!("inquiry.member");
         let mut wrong_literal = value.clone();
         wrong_literal["resultClassification"] = json!("PASS");
         assert!(
